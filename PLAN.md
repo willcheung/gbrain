@@ -148,7 +148,34 @@ Email ingestion would enable forwarding Granola meeting notes, customer emails, 
 
 **When IT approves:** Set up `brain@yourcompany.com` as a shared inbox. Anyone on the team can forward to it. gbrain's existing email-to-brain recipe polls and ingests.
 
-### Phase 7: PRD toolkit integration
+### Phase 7: Nightly curation agent (inspired by Stash's sleep agent)
+Inspired by [Fergana-Labs/stash](https://github.com/Fergana-Labs/stash)'s "sleep agent" pattern — a background agent that periodically reviews and improves the knowledge base.
+
+**What it does (runs nightly as a Minions cron job):**
+- Clusters related tickets/calls/feature requests by theme → creates/updates pain point summary pages
+- Deduplicates entity pages (merges "Acme Corp" / "Acme Corporation" / "ACME" into one)
+- Flags stale information (customer churned but still marked active, resolved tickets still linked as open)
+- Generates weekly "what changed" digest for PMs
+- This is essentially `pain-point-radar` running on a cron, not just on-demand
+
+**Implementation:** Subagent job with `traverse_graph`, `search`, `get_page`, `put_page` tools. Runs during off-hours via cron-scheduler skill with quiet hours.
+
+### Phase 8: Temporal relationships (inspired by Graphiti)
+Inspired by [getzep/graphiti](https://github.com/getzep/graphiti)'s temporal knowledge graph — edges have validity windows.
+
+**Problem:** "Acme is_customer_of us" is true from 2024-01-15 but they churned on 2026-03-01. Without temporal edges, the graph says they're still a customer. Same for: people who changed companies, features that shipped (no longer a "request"), resolved escalations.
+
+**Implementation:** Add `valid_from` / `valid_until` to link frontmatter/context. Not a schema change — just metadata in the existing `context` field or page frontmatter. The nightly curation agent (Phase 7) would be responsible for updating these when it detects contradictions (e.g., a `churned` event should close the `is_customer_of` edge).
+
+**Example:**
+```
+companies/acme-corp:
+  is_customer_of: {valid_from: 2024-01-15, valid_until: 2026-03-01, reason: churned}
+  renewed: {valid_from: 2024-01-15, valid_until: 2025-01-15}
+  churned: {valid_from: 2026-03-01}
+```
+
+### Phase 9: PRD toolkit integration
 Wire gbrain to PagerDuty/prd-toolkit so PRDs are grounded in real customer data.
 
 **prd-prep skill** — generates a research package for any topic by querying the brain
@@ -278,6 +305,17 @@ The README documents 18 of gbrain's 29 skills that apply to customer intelligenc
 - **minion-orchestrator** — durable background jobs for sync pipelines
 - **reports** — timestamped reports with keyword routing
 - **query** — 3-layer search with synthesis and citations
+
+## Open source projects we looked at
+
+| Project | What it does | What we took from it |
+|---|---|---|
+| [garrytan/gbrain](https://github.com/garrytan/gbrain) | AI agent memory system with self-wiring knowledge graph | The entire foundation — forked it |
+| [Fergana-Labs/stash](https://github.com/Fergana-Labs/stash) | Shared memory for coding agents, Karpathy-style wiki | Sleep agent / nightly curation pattern (Phase 7). Team shared knowledge concept. |
+| [getzep/graphiti](https://github.com/getzep/graphiti) | Temporal knowledge graph for agents | Temporal edges with validity windows (Phase 8). Contradiction resolution. |
+| [mem0ai/mem0](https://github.com/mem0ai/mem0) | Memory layer for AI agents | Ideas around memory scoring, relevance decay, conflict resolution. Not yet incorporated. |
+| [run-llama/llama_index](https://github.com/run-llama/llama_index) | Property graph index, structured extraction | Structured extraction patterns for turning Gong transcripts into entities. Not yet incorporated. |
+| [PagerDuty/prd-toolkit](https://github.com/PagerDuty/prd-toolkit) | Interactive PRD creation (private) | Integration target — brain provides research, prd-toolkit generates PRDs (Phase 9) |
 
 ## Known issues
 - `build-llms` test fails because our README diverges from upstream's generator output. Expected, not worth fixing.
