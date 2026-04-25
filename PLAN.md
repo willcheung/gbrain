@@ -30,7 +30,16 @@ Anyone who touches customer data can use it, but PMs are the primary audience.
 - Weekly upstream sync via launchd (script: `scripts/sync-upstream.sh`)
 - Bun installed, dependencies installed, 2416 tests passing
 
-### 2. Customer-domain relationship types
+### 2. Local Postgres + pgvector
+- Postgres 17 installed via Homebrew (runs at login via `brew services`)
+- pgvector 0.8.2 installed
+- Database: `postgresql://wcheung@localhost/gbrain`
+- All 20 schema migrations applied, health score 90/100
+- Subagents and Minions job queue ready
+- `~/.bun/bin` needs to be on PATH (`gbrain` CLI linked there)
+- `DATABASE_URL` needs to be set in `~/.zshrc`
+
+### 3. Customer-domain relationship types
 Added 7 new relationship types with deterministic regex inference (zero LLM calls):
 
 | Relationship | What it captures | Regex pattern |
@@ -46,13 +55,13 @@ Added 7 new relationship types with deterministic regex inference (zero LLM call
 ### 3. Customer-domain page types
 Added 4 new page types: `ticket`, `feature`, `call`, `status`
 
-### 4. Files modified
+### 5. Files modified
 - `src/core/link-extraction.ts` — regex patterns, inferLinkType, FRONTMATTER_LINK_MAP, DIR_PATTERN
 - `src/core/types.ts` — PageType union extended
 - `src/core/markdown.ts` — inferType for new directories
 - `src/commands/extract.ts` — inferTypeByDir for directory-based inference
 
-### 5. README rewritten
+### 6. README rewritten
 Reframed for PM use case with customer intelligence focus, gbrain attribution, applicable upstream skills documented, and concrete PM use cases.
 
 ## What's next — in priority order
@@ -274,4 +283,8 @@ The README documents 18 of gbrain's 29 skills that apply to customer intelligenc
 - `build-llms` test fails because our README diverges from upstream's generator output. Expected, not worth fixing.
 - 2 other pre-existing test failures unrelated to our changes (PGLite shell test, OpenClaw compat test).
 - Bun is installed via Homebrew at `/opt/homebrew/bin/bun`. Must `source ~/.zshrc` before running bun commands in scripts.
+- `gbrain` CLI is at `~/.bun/bin/gbrain` — needs `~/.bun/bin` on PATH.
+- `DATABASE_URL=postgresql://wcheung@localhost/gbrain` must be set for Postgres mode.
+- Postgres 17 runs as a Homebrew service (auto-starts at login). Stop with `brew services stop postgresql@17`.
 - Org-wide Claude Code hook blocks `git push` to main/master. Must push manually via `! git push origin main`.
+- Supabase not an option — sensitive customer data can't go to third-party cloud. Local Postgres only.
