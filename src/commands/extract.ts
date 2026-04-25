@@ -170,6 +170,16 @@ function inferTypeByDir(fromDir: string, toDir: string, frontmatter?: Record<str
   if (from === 'people' && to === 'deals') return 'involved_in';
   if (from === 'deals' && to === 'companies') return 'deal_for';
   if (from === 'meetings' && to === 'people') return 'attended';
+  // Customer intelligence directory-based inference
+  if (from === 'tickets' && to === 'companies') return 'filed_ticket';
+  if (from === 'tickets' && to === 'people') return 'filed_ticket';
+  if (from === 'tickets' && to === 'features') return 'requested_feature';
+  if (from === 'features' && to === 'companies') return 'requested_feature';
+  if (from === 'features' && to === 'people') return 'requested_feature';
+  if (from === 'calls' && to === 'people') return 'had_call';
+  if (from === 'calls' && to === 'companies') return 'had_call';
+  if (from === 'status' && to === 'people') return 'works_at';
+  if (from === 'status' && to === 'tickets') return 'related_to';
   return 'mentions';
 }
 

@@ -176,6 +176,11 @@ function inferType(filePath?: string): PageType {
   if (lower.includes('/cal/') || lower.includes('/calendar/')) return 'calendar-event';
   if (lower.includes('/notes/') || lower.includes('/note/')) return 'note';
   if (lower.includes('/meetings/') || lower.includes('/meeting/')) return 'meeting';
+  // Customer intelligence page types
+  if (lower.includes('/tickets/') || lower.includes('/ticket/')) return 'ticket';
+  if (lower.includes('/features/') || lower.includes('/feature/')) return 'feature';
+  if (lower.includes('/calls/') || lower.includes('/call/')) return 'call';
+  if (lower.includes('/status/') || lower.includes('/status-reports/')) return 'status';
   return 'concept';
 }
 

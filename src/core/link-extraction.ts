@@ -44,7 +44,7 @@ export type LinkResolutionType = 'qualified' | 'unqualified';
  *   - Our domain extensions: tech, finance, personal, openclaw (domain-organized wikis)
  *   - Our entity prefix: entities (we kept some legacy entities/projects/ pages)
  */
-const DIR_PATTERN = '(?:people|companies|meetings|concepts|deal|civic|project|projects|source|media|yc|tech|finance|personal|openclaw|entities)';
+const DIR_PATTERN = '(?:people|companies|meetings|concepts|deal|civic|project|projects|source|media|yc|tech|finance|personal|openclaw|entities|tickets|features|calls|status)';
 
 /**
  * Match `[Name](path)` markdown links pointing to entity directories.
@@ -368,6 +368,39 @@ function excerpt(s: string, idx: number, width: number): string {
 //   - Promoted/staff-engineer forms: "promoted to (staff|senior|principal) engineer at".
 const WORKS_AT_RE = /\b(?:CEO of|CTO of|COO of|CFO of|CMO of|CRO of|VP at|VP of|VPs? Engineering|VPs? Product|works at|worked at|working at|employed by|employed at|joined as|joined the team|engineer at|engineer for|director at|director of|head of|heads up .{0,20} at|leads engineering|leads product|leads the .{0,20} (?:team|org) at|manages engineering at|manages product at|running (?:engineering|product|design) at|currently at|previously at|previously worked at|spent .* (?:years|months) at|stint at|stint as|tenure at|tenure as|role at|position at|(?:senior|staff|principal|lead|backend|frontend|full-?stack|ML|data|security) engineer at|promoted to (?:senior|staff|principal|lead) .{0,20} at|(?:his|her|their|my) time at)\b/i;
 
+// ─── Customer intelligence relationship patterns ────────────────
+//
+// These patterns detect customer-domain relationships: tickets filed,
+// features requested, calls/meetings with customers, escalations,
+// renewals, and churn signals. Used to build a customer knowledge graph
+// from ingested Zendesk tickets, Gong calls, User Voice items,
+// Salesforce records, and JIRA status reports.
+
+// Ticket/support context. Matches support interactions, bug reports,
+// and issue filings across Zendesk, JIRA, and similar systems.
+const FILED_TICKET_RE = /\b(?:filed (?:a |the )?(?:ticket|issue|bug|support request|case)|opened (?:a |the )?(?:ticket|issue|case|support request)|reported (?:a |an )?(?:bug|issue|problem|outage)|submitted (?:a |the )?(?:ticket|case|support request)|raised (?:a |an )?(?:issue|ticket|case|incident)|created (?:a |the )?(?:support ticket|case|incident)|ticket from|case from|reported by|filed by|opened by)\b/i;
+
+// Feature request context. Matches feature requests, enhancement
+// proposals, and product feedback from User Voice, Salesforce, etc.
+const REQUESTED_FEATURE_RE = /\b(?:requested (?:a |the )?(?:feature|enhancement|capability|improvement)|feature request(?:ed)? (?:from|by)|asked for|requesting (?:a |the )?(?:feature|change|enhancement|integration)|wants? (?:us to|a |the )?(?:add|build|support|implement|integrate)|needs? (?:us to|a )?(?:add|build|support|implement)|voted for|upvoted|(?:product )?feedback (?:from|by)|suggested (?:a |an |the )?(?:feature|improvement|enhancement))\b/i;
+
+// Customer call/meeting context. Matches Gong calls, customer meetings,
+// discovery calls, QBRs, and similar customer interactions.
+const HAD_CALL_RE = /\b(?:call with|meeting with|spoke with|talked (?:to|with)|met with|demo (?:for|with)|QBR with|quarterly (?:business )?review with|discovery call|check-?in (?:call |meeting )?with|onboarding (?:call|session|meeting) with|kickoff (?:call|meeting) with|customer (?:call|meeting|session) with)\b/i;
+
+// Customer relationship. Matches customer/account ownership and
+// association patterns from Salesforce and CRM data.
+const IS_CUSTOMER_RE = /\b(?:customer of|client of|account (?:owned by|managed by|assigned to)|pays for|subscribes to|using (?:our |the )?(?:product|platform|service)|signed (?:up|on) (?:for|with)|contracted with|purchased|buyer of|end user of|licensed)\b/i;
+
+// Escalation context. Matches support escalations, executive
+// escalations, and severity upgrades.
+const ESCALATED_RE = /\b(?:escalat(?:ed|ion)|raised (?:to |with )?(?:management|executive|leadership|VP|CTO|CEO)|P[01] (?:incident|issue|ticket)|critical (?:issue|bug|incident|outage)|sev(?:erity)? ?[012]|high[- ]priority (?:issue|ticket|incident)|executive escalation|urgent (?:issue|request|ticket))\b/i;
+
+// Renewal/churn context. Matches contract renewals, churn signals,
+// and retention-related patterns.
+const CHURNED_RE = /\b(?:churned|cancelled|canceled|did not renew|failed to renew|lost (?:the )?(?:account|customer|deal)|contract (?:ended|expired|terminated)|off-?boarded|stopped using|discontinued|switched (?:to|from)|migrated (?:away|to a competitor)|at risk of churning|churn risk)\b/i;
+const RENEWED_RE = /\b(?:renewed|renewal|re-?signed|extended (?:the )?(?:contract|agreement|subscription)|upsell|up-?sold|expanded (?:the )?(?:contract|deal|account)|upgraded (?:to|their)|increased (?:usage|seats|spend)|contract extension)\b/i;
+
 // Investment context. Order patterns from most-specific to least to keep
 // regex efficient. Includes funding-round verbs ("led the seed", "led X's
 // Series A"), narrative verbs ("invests in", "investing in"), historical
@@ -438,7 +471,18 @@ export function inferLinkType(pageType: PageType, context: string, globalContext
     return 'mentions';
   }
   if ((pageType as string) === 'meeting') return 'attended';
-  // Per-edge verb rules.
+
+  // Customer intelligence per-edge verb rules (higher specificity, check first).
+  // Escalation > ticket > feature request > call > churn > renewal > customer.
+  if (ESCALATED_RE.test(context)) return 'escalated';
+  if (FILED_TICKET_RE.test(context)) return 'filed_ticket';
+  if (REQUESTED_FEATURE_RE.test(context)) return 'requested_feature';
+  if (HAD_CALL_RE.test(context)) return 'had_call';
+  if (CHURNED_RE.test(context)) return 'churned';
+  if (RENEWED_RE.test(context)) return 'renewed';
+  if (IS_CUSTOMER_RE.test(context)) return 'is_customer_of';
+
+  // Original per-edge verb rules.
   if (FOUNDED_RE.test(context)) return 'founded';
   if (INVESTED_RE.test(context)) return 'invested_in';
   if (ADVISES_RE.test(context)) return 'advises';
@@ -527,6 +571,27 @@ export const FRONTMATTER_LINK_MAP: FrontmatterFieldMapping[] = [
     dirHint: ['companies', 'funds', 'people'] },
   // Meeting pages
   { fields: ['attendees'], pageType: 'meeting', type: 'attended', direction: 'incoming', dirHint: 'people' },
+
+  // ─── Customer intelligence frontmatter mappings ───────────────
+  //
+  // Ticket pages: customer who filed, company account, features referenced
+  { fields: ['filed_by', 'reporter'], pageType: 'ticket', type: 'filed_ticket', direction: 'incoming', dirHint: 'people' },
+  { fields: ['account', 'customer_account'], pageType: 'ticket', type: 'is_customer_of', direction: 'outgoing', dirHint: 'companies' },
+  { fields: ['features_requested', 'feature_requests'], pageType: 'ticket', type: 'requested_feature', direction: 'outgoing', dirHint: 'features' },
+  { fields: ['escalated_to'], pageType: 'ticket', type: 'escalated', direction: 'outgoing', dirHint: 'people' },
+  // Feature pages: who requested, which accounts want it
+  { fields: ['requested_by'], pageType: 'feature', type: 'requested_feature', direction: 'incoming', dirHint: ['people', 'companies'] },
+  { fields: ['accounts', 'requesting_accounts'], pageType: 'feature', type: 'requested_feature', direction: 'incoming', dirHint: 'companies' },
+  // Call pages (Gong calls, customer meetings): participants and account
+  { fields: ['participants', 'attendees'], pageType: 'call', type: 'had_call', direction: 'incoming', dirHint: 'people' },
+  { fields: ['account', 'customer_account'], pageType: 'call', type: 'is_customer_of', direction: 'outgoing', dirHint: 'companies' },
+  // Company/account pages: customer relationship, renewal/churn status
+  { fields: ['customers', 'customer_contacts'], pageType: 'company', type: 'is_customer_of', direction: 'incoming', dirHint: 'people' },
+  { fields: ['account_owner', 'csm'], pageType: 'company', type: 'works_at', direction: 'incoming', dirHint: 'people' },
+  // Status report pages (from JIRA)
+  { fields: ['owner', 'assignee'], pageType: 'status', type: 'works_at', direction: 'incoming', dirHint: 'people' },
+  { fields: ['related_tickets'], pageType: 'status', type: 'related_to', direction: 'outgoing', dirHint: 'tickets' },
+
   // Any page type
   { fields: ['sources'], type: 'discussed_in', direction: 'incoming', dirHint: ['source', 'media'] },
   { fields: ['source'], type: 'source', direction: 'outgoing', dirHint: '' /* already slug-shaped */ },
