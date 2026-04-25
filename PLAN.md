@@ -66,14 +66,192 @@ Reframed for PM use case with customer intelligence focus, gbrain attribution, a
 
 ## What's next — in priority order
 
-### Phase 1: Confluence ingestion
-**Why first:** Internal specs, past PRDs, architectural decisions, and product documentation live here. This is the "building context" that PMs need alongside customer signal. The Atlassian MCP server is already configured in Claude Code settings.
+### Phase 1: OCP Status Report + JIRA Ingestion
 
-**What to build:**
-- Integration recipe that pulls Confluence pages into brain pages
-- Entity extraction on ingest (people, projects, features mentioned in docs)
-- Map Confluence spaces to brain directories
-- Incremental sync (only pull changed pages)
+This is the first concrete use case: ingest the weekly team status reports from Confluence AND the underlying JIRA tickets they reference, plus JIRA tickets they DON'T reference (backlog, upcoming). The goal is "what changed since last sprint across all teams?" answerable from the brain, plus visibility into what's coming next.
+
+#### What we found (scan results)
+
+**Confluence — OCP Team Status Reports folder (ID 5087494160):**
+- **70 pages** in the `OCP` (Operations Cloud Platform) space
+- **9 active teams** reporting weekly: NEXT, Mobile, Ingestion, AAX, DevEco, MnE, AppEx, AuthNZ, Integrations
+- **Date range:** Dec 15, 2025 → Apr 24, 2026 (gap in Jan-Feb)
+- **Consistent template:** Highlights (medal-ranked priorities with JIRA epics), Blockers, Cross-team dependencies, Customer/production issues, Delivery risks
+- **~130+ JIRA ticket references per week** with parseable patterns: `[PROJECT-NNNN](url) — Title _(Status — Assignee)_`
+- **Entities per report:** people (full names), customers (account names, often tagged Premium), services, infrastructure, SLOs (Ingestion only)
+- **Outliers:** NEXT and DevEco use prose only (no JIRA IDs). NEXT uses different title format (`NEXT-FY27Q1-MMDDYYYY` vs `Team-Q1FY27-MMDDYY`).
+
+**JIRA — full read access confirmed (117 projects visible):**
+
+| Project Key | Team | Example Epics |
+|---|---|---|
+| `NEXT` | Notifications Experience | (prose-only in reports, no IDs) |
+| `MOCO` | Mobile Core | MOCO-10532 Graduated Rollouts |
+| `ING` | Ingestion | ING-3335 Staging as Pre-Production |
+| `AAX` | Account Admin Experience | AAX-5590 IP Allow Lists |
+| `DEVECO` | Dev Ecosystem & Public APIs | (prose-only in reports) |
+| `MNE` | Monetization & Entitlements | MNE-6624 Reliability improvements |
+| `AUTH` | Authentication & Authorization | AUTH-2886 FedRAMP, AUTH-3023 AI Transformation |
+| `INTGR` | Integrations | INTGR-168 Jira Cloud Connect → Forge |
+| `CSOT` | CSOps & Ticketing | CSOT-1963 Reliability OKR-0 |
+| `GBFM` | GBFM migration (AppEx) | GBFM-168 /api_keys |
+| `FEP` | Front End Platform (AppEx) | FEP-484 Dark Mode |
+| `PD` | AppEx general | PD-938, PD-1018 |
+| `FEAST` | AppEx infra | FEAST-875 |
+
+**Key JIRA fields available:**
+- Summary, Description, Status, Priority (P0-P4), Assignee, Reporter
+- Story Points (`customfield_10004`), Sprint (`customfield_10007`)
+- **Type of work** (`customfield_16588`): Planned-Product Roadmap, Planned-Proactive Maintenance, Planned-Engineering Roadmap, Unplanned-Specific Customer Request, Unplanned-Cross-Team Request, Unplanned-Reactive Maintenance, Administrative
+- **Customer Investigation** issue type with Salesforce case links
+- Parent (epic link), Linked Issues, Components, Labels, Due date, Start date
+
+**Issue types:** Epic, Story, Task, Bug, Spike, Customer Investigation, Security Finding, Operational Issue
+
+#### Ingestion approach — three layers
+
+**Layer 1: Confluence status reports → `status/` brain pages**
+
+Each weekly report becomes one brain page:
+```
+status/ocp/next-2026-04-24
+status/ocp/mobile-2026-04-24
+status/ocp/ing-2026-04-24
+...
+```
+
+Frontmatter includes team name, author, date, space. Body is the full report markdown. Signal-detector extracts:
+- People mentioned → `people/` pages (auto-enriched)
+- JIRA tickets mentioned → `tickets/` pages (cross-linked)
+- Customer names in "Customer/production issues" → `companies/` pages
+- Services mentioned → entity pages
+- Epic status (in progress, blocked, done) → relationship edges
+
+**Layer 2: JIRA tickets → `tickets/` brain pages**
+
+Every issue in the 10+ OCP project keys becomes a brain page:
+```
+tickets/jira/auth-2886
+tickets/jira/ing-3816
+tickets/jira/moco-10532
+...
+```
+
+Frontmatter:
+```yaml
+type: ticket
+source: jira
+project: AUTH
+key: AUTH-2886
+status: Open
+priority: P4
+assignee: Liberty Garcia
+reporter: Christopher Kwai-Pun
+issue_type: Epic
+story_points: null
+sprint: Q1FY27 Sprint 4
+type_of_work: Planned-Product Roadmap
+parent_epic: null
+created: 2026-03-01
+updated: 2026-04-24
+```
+
+Body: summary + description + links to related issues.
+
+This layer captures tickets **not mentioned in status reports** — backlog items, upcoming stories, spikes, bugs, customer investigations. This is the "what's coming" layer the status reports miss.
+
+**Layer 3: JIRA epics → `epics/` brain pages (rollup)**
+
+Epics get their own pages with child ticket status aggregated:
+```
+epics/jira/auth-2886-fedramp-saml-only
+```
+
+The brain auto-links: epic → child tickets → assignees → teams → status reports that mention them. This enables queries like "what's the status of FedRAMP across all teams?" or "which epics are blocked?"
+
+#### Entity graph that emerges
+
+```
+status/ocp/authnz-2026-04-24
+    ├── mentions → tickets/jira/auth-2886 (FedRAMP)
+    ├── mentions → tickets/jira/auth-3027 (Permissions MVP)
+    ├── mentions → people/liberty-garcia
+    ├── mentions → people/christopher-kwai-pun
+    ├── filed_ticket → companies/twosigma (customer issue)
+    └── filed_ticket → companies/paypal (customer issue)
+
+tickets/jira/auth-2886
+    ├── is_child_of → epics/jira/auth-2886-fedramp
+    ├── assigned_to → people/liberty-garcia
+    ├── works_at → teams/authnz
+    ├── mentioned_in → status/ocp/authnz-2026-04-24
+    ├── mentioned_in → status/ocp/authnz-2026-04-17
+    └── related_to → tickets/jira/auth-2893
+
+tickets/jira/aax-6611 (Customer Investigation)
+    ├── filed_ticket → companies/nylcloud
+    ├── assigned_to → people/lewis-rafuse
+    └── is_child_of → epics/jira/aax-...
+```
+
+#### What this enables
+
+| Query | How the brain answers it |
+|---|---|
+| "What changed since last sprint across all teams?" | Pull latest `status/ocp/*` pages, synthesize highlights |
+| "What's blocked right now?" | Search tickets with status=Blocked + status report "Blockers" sections |
+| "What's coming up for AuthNZ?" | Epics with status=Open/In Progress + backlog tickets not yet in any status report |
+| "Which customers have open production issues?" | Customer Investigation tickets + status report customer sections |
+| "Who's working on reliability?" | Traverse from `Reliability` keyword → epics → assignees → teams |
+| "What's the status of the Jira Cloud migration?" | `epics/jira/intgr-168` → child tickets → latest status report mention |
+| "Which teams have delivery risks?" | Status report "Delivery risks" sections, cross-referenced with blocked tickets |
+| "Show me all P0/P1 tickets across OCP" | JIRA tickets with priority P0/P1, linked to teams and customers |
+
+#### Implementation plan
+
+**Step 1: Bulk ingest existing 70 Confluence status reports**
+- Script using Atlassian MCP `getConfluencePage` for each of the 70 page IDs
+- Parse markdown into brain page format with frontmatter
+- Write to brain via `put_page` or direct page creation
+- Entity extraction runs automatically on write
+
+**Step 2: Bulk ingest JIRA tickets from all OCP projects**
+- JQL: `project in (NEXT, MOCO, ING, AAX, DEVECO, MNE, AUTH, INTGR, CSOT, GBFM, FEP, PD, FEAST) AND updated >= -90d ORDER BY updated DESC`
+- Page 100 at a time, create brain page per issue
+- Include: summary, description, status, priority, assignee, reporter, epic parent, sprint, story points, type of work, linked issues
+- For epics: also fetch child issues to build rollup
+
+**Step 3: Build cross-links**
+- JIRA ticket IDs mentioned in Confluence reports → link `status/` pages to `tickets/` pages
+- Epic → child ticket hierarchy
+- Assignee → `people/` pages
+- Customer Investigation tickets → `companies/` pages (parse customer name from summary)
+
+**Step 4: Set up continuous sync (cron via Minions)**
+
+| Sync | Schedule | What it pulls |
+|---|---|---|
+| Confluence status reports | Daily at 10pm (after reports are posted) | `ancestor = 5087494160 AND lastModified >= yesterday` via CQL |
+| JIRA active tickets | Every 4 hours | `project in (...) AND updated >= -4h` via JQL |
+| JIRA epics rollup | Daily at midnight | All open epics, re-aggregate child status |
+| Full JIRA resync | Weekly Sunday | All tickets updated in last 90 days, reconcile |
+
+**Step 5: Backlog discovery (the "not in status reports" layer)**
+- Weekly scan: `project in (...) AND status in (Open, "To Do", Triaged) AND type != Sub-task ORDER BY created DESC`
+- These are tickets that haven't appeared in any status report yet
+- Tag them in the brain as `backlog: true` in frontmatter
+- Enables "what's in the backlog that nobody's talking about?" queries
+
+#### Parsing patterns (for entity extraction from status reports)
+
+```
+Epic declaration:  /\[([A-Z]+-\d+)\s*[—–-]\s*(.+?)\]\(https:\/\/pagerduty\.atlassian\.net/
+Ticket bullet:     /\[([A-Z]+-\d+)\]\(https:\/\/pagerduty\.atlassian\.net.+?\)\s*[—–-]\s*(.+?)_\((.+?)\)_/
+Customer name:     /\*\*Customer:\*\*\s*(.+?)\s*\|/
+Priority:          /\*\*Priority:\*\*\s*(P[0-4])/
+Person assignment: /_\(.*?[—–-]\s*(.+?)\)_/
+SLO metric:        /The\s+(\d+)-day SLO is at\s+([\d.]+)/
+```
 
 ### Phase 2: Snowflake sync
 **Why second:** This is the bulk historical customer data — Gong transcripts, Zendesk tickets, User Voice requests, Salesforce accounts. The knowledge graph is only as good as the data in it. Without this, the customer-domain relationship types we built have nothing to link.
@@ -110,11 +288,15 @@ Snowflake views → Minions cron job → brain pages → signal-detector → kno
 - Enrich at ingest time using the poster's account ownership (Sarah from CS owns Acme → probably about Acme)
 - Let the graph fill in over time (tomorrow's Gong call will have the company name)
 
-### Phase 4: JIRA sync
+### Phase 4: JIRA backlog intelligence
+**Why after Phase 1:** Phase 1 ingests JIRA tickets referenced in status reports + recent active tickets. Phase 4 goes deeper — full backlog analysis, velocity tracking, and predictive queries.
+
 **What to build:**
-- `jira-sync` integration recipe
-- Pull status updates, sprint data, epic progress
-- Create `status/` brain pages for report consolidation
+- Backlog health dashboard: stale tickets, unassigned epics, aging customer investigations
+- Sprint velocity tracking: story points completed vs planned per team per sprint
+- "Type of work" analysis: what % is planned roadmap vs reactive maintenance vs customer requests?
+- Cross-team dependency graph: which teams block each other most often?
+- Customer investigation SLA tracking: time from creation to resolution by priority
 
 ### Phase 5: Customer intelligence skills
 These are the PM-facing query skills that make the brain useful:
@@ -193,12 +375,12 @@ Wire gbrain to PagerDuty/prd-toolkit so PRDs are grounded in real customer data.
 ### Connected or ready to connect
 | Source | What it gives us | Status |
 |---|---|---|
-| Confluence | Internal specs, PRDs, decisions, architecture docs | MCP server configured, ready to ingest |
+| Confluence | Internal specs, PRDs, decisions, architecture docs, **70 weekly status reports from 9 OCP teams** | MCP server configured, authenticated, full read access confirmed |
 | User Voice | Feature requests, votes, customer feedback | In Snowflake, needs sync recipe |
 | Zendesk | Support tickets, customer issues, escalations | In Snowflake, needs sync recipe |
 | Gong | Call transcripts, customer conversations | In Snowflake, needs sync recipe |
 | Salesforce | Accounts, contacts, ARR, renewal dates, deal stages | In Snowflake, needs sync recipe |
-| JIRA | Status reports, sprint data, epic progress | Needs sync recipe |
+| JIRA | Status reports, sprint data, epic progress, **117 projects visible, 10+ OCP project keys, full read access, Customer Investigation type with Salesforce links** | MCP server configured, authenticated, full read/write access confirmed |
 | Slack | Real-time team signal, customer discussions | MCP server configured, needs 🧠 reaction setup |
 | Snowflake | Warehouse for all structured/unstructured data above | Needs sync recipe (the main pipeline) |
 
