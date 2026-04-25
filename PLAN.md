@@ -127,6 +127,19 @@ These are the PM-facing query skills that make the brain useful:
 - Consolidates by team/epic/sprint
 - Replaces chasing PMs across channels for status updates
 
+### Phase 6: PRD toolkit integration
+Wire gbrain to PagerDuty/prd-toolkit so PRDs are grounded in real customer data.
+
+**prd-prep skill** — generates a research package for any topic by querying the brain
+- Input: topic or feature name
+- Output: directory of markdown files (pain points, requesting customers, tickets, call excerpts, escalations, past PRDs, competitive mentions)
+- Feed output to `/prd-create --research <dir>`
+
+**post-PRD ingestion** — after a PRD is created, ingest it back into the brain
+- PRD becomes a brain page linked to features, customers, tickets it references
+- Enables "have we PRD'd this before?" and "what happened last time?" queries
+- Closes the learning loop between PRDs and outcomes
+
 ## Data sources — full picture
 
 ### Connected or ready to connect
@@ -150,6 +163,67 @@ These are the PM-facing query skills that make the brain useful:
 | Figma | Design artifacts, past explorations, UX research | "What's been tried before?" for scoping |
 | Engineering ADRs / code repos | Technical constraints, dependencies, tech debt | "What's feasible?" for scoping |
 | Past PRD outcomes | PRD → delivery status → adoption → customer feedback | "We tried this before. What happened?" — the learning loop |
+
+## PRD Toolkit integration
+
+### What it is
+[PagerDuty/prd-toolkit](https://github.com/PagerDuty/prd-toolkit) (private) is an interactive PRD creation tool that generates 18-27 output files (complete PRD, executive briefings, customer decks, risk registers, technical feasibility assessments) through an 11-step guided workflow with specialized AI agents (PM, designer, architect, engineer, tech writer). Costs $1.50-$3.00 per PRD. Supports feature, refactor, and architecture PRD types. Has PLM (Product Lifecycle Management) integration for strategic initiatives.
+
+### Why combine them
+prd-toolkit generates PRDs. gbrain provides the customer evidence to ground them. Without gbrain, the discovery phase relies on the PM's memory and web research. With gbrain, every step draws from real customer data:
+
+| PRD step | Without gbrain | With gbrain |
+|---|---|---|
+| Problem exploration | PM describes from memory | Brain surfaces Zendesk ticket clusters, Gong call themes, escalation patterns |
+| Personas | AI generates generic personas | Brain pulls actual customer profiles, segments by real behavior |
+| Research | Web search for competitors | Brain has Gong calls where customers name competitors directly |
+| Requirements | PM lists from memory | Brain shows what customers actually asked for, with frequency counts |
+| Metrics | Generic KPIs | Brain shows current baselines (ticket volume, churn rate for this area) |
+| Risks | Guesswork | Brain shows past PRDs that addressed similar problems and what happened |
+
+### Integration approach — keep them separate
+Don't merge the repos. Both evolve independently and get upstream updates. Wire them together via:
+
+1. **gbrain as MCP server** — prd-toolkit's agents can query the brain during each step via MCP tools (`search`, `query`, `traverse_graph`, `get_page`)
+2. **`prd-prep` skill in gbrain (build this)** — given a topic, queries the brain for all related customer signal (tickets, calls, feature requests, customer quotes, past PRDs) and dumps a research package into a directory
+3. **Feed research to prd-toolkit** — `/prd-create "topic" --research <dir>` picks up the brain's research package as input context
+4. **Post-PRD ingestion** — after the PRD is generated, ingest it back into the brain as a page linked to the features, customers, and tickets it references. Closes the loop for "past PRD outcomes" tracking.
+
+### Workflow end to end
+```
+PM has a feature idea
+    ↓
+gbrain prd-prep "SSO support"
+    → queries brain for all related signal
+    → dumps research package to ./research/sso-support/
+    ↓
+/prd-create "enterprise SSO" --type feature --research ./research/sso-support/ --plm
+    → 11-step guided workflow, grounded in real customer data
+    → generates PRD + supporting docs + PLM planning
+    ↓
+gbrain ingest ./output/enterprise-sso-20260424/prd.md
+    → PRD becomes a brain page
+    → linked to features/sso-support, related tickets, requesting customers
+    → next time someone asks "have we PRD'd SSO?" the brain knows
+```
+
+### New skill to build: prd-prep
+A gbrain skill that generates a research package for prd-toolkit:
+
+**Input:** a topic or feature name
+**Output:** a directory of markdown files:
+```
+research/{topic}/
+├── customer-pain-points.md    ← clustered feedback from Zendesk, Gong, User Voice
+├── requesting-customers.md    ← accounts that asked for this, with ARR and context
+├── related-tickets.md         ← support tickets mentioning this area
+├── call-excerpts.md           ← relevant Gong call snippets
+├── escalation-history.md      ← P0/P1 incidents related to this
+├── past-prds.md               ← previous PRDs that touched this area
+└── competitive-mentions.md    ← what customers said about alternatives
+```
+
+This skill should be built after Phase 5 (customer intelligence skills) since it depends on data being in the brain.
 
 ## Architecture decisions
 
