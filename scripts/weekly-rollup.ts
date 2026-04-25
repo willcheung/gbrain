@@ -34,6 +34,19 @@ const TEAM_DISPLAY: Record<string, string> = {
   'integrations': 'Integrations',
 };
 
+/** Map JIRA project keys to team keys */
+const PROJECT_TO_TEAM: Record<string, string> = {
+  'NEXT': 'next',
+  'MOCO': 'mobile',
+  'ING': 'ing',
+  'AAX': 'aax',
+  'DEVECO': 'deveco',
+  'MNE': 'mne',
+  'GBFM': 'appex', 'FEP': 'appex', 'PD': 'appex', 'FEAST': 'appex',
+  'AUTH': 'authnz',
+  'INTGR': 'integrations', 'CSOT': 'integrations',
+};
+
 interface StatusReport {
   slug: string;
   title: string;
@@ -108,7 +121,6 @@ async function getHighPriorityOpen(sql: ReturnType<typeof db.getConnection>): Pr
       AND frontmatter->>'priority' IN ('P0', 'P1')
       AND frontmatter->>'status' NOT IN ('Done', 'Closed')
     ORDER BY frontmatter->>'priority', frontmatter->>'project', title
-    LIMIT 50
   `;
   return rows.map(rowToTicket);
 }
@@ -121,7 +133,6 @@ async function getCustomerIssuesOpen(sql: ReturnType<typeof db.getConnection>): 
       AND frontmatter->>'issue_type' = 'Customer Investigation'
       AND frontmatter->>'status' NOT IN ('Done', 'Closed')
     ORDER BY frontmatter->>'priority', title
-    LIMIT 50
   `;
   return rows.map(rowToTicket);
 }
@@ -232,6 +243,68 @@ function extractOneLineStatus(report: StatusReport): string {
   return 'See full report';
 }
 
+/** Extract a multi-line status snippet — top priorities with status */
+function extractStatusSnippet(report: StatusReport): string {
+  const body = report.body;
+  const lines: string[] = [];
+
+  // Extract medal-ranked priorities (🥇🥈🥉) with their epic status
+  const medalPattern = /(?:🥇|🥈|🥉|####?\s*🥇|####?\s*🥈|####?\s*🥉)\s*(.+?)(?:\n|$)/g;
+  let match;
+  while ((match = medalPattern.exec(body)) !== null) {
+    let heading = match[1].replace(/\*\*/g, '').replace(/<custom[^>]*>.*?<\/custom>/g, '').trim();
+    if (!heading) continue;
+
+    // Try to find the epic status on the next line
+    const afterMatch = body.slice(match.index + match[0].length, match.index + match[0].length + 500);
+    const epicStatus = afterMatch.match(/\*\*Epic:\*\*\s*\[([A-Z]+-\d+)\s*[—–-]\s*(.+?)\].*?\|\s*(.+?)(?:\n|$)/);
+    if (epicStatus) {
+      const status = epicStatus[3].replace(/[🔄📋✅🚧⏸️]/g, '').trim();
+      lines.push(`• ${heading} (${epicStatus[1]}) — ${status}`);
+    } else {
+      lines.push(`• ${heading}`);
+    }
+  }
+
+  // If no medals found, try bold headings (NEXT/DevEco style)
+  if (lines.length === 0) {
+    const boldPattern = /(?:^|\n)\*\*(.+?)\*\*\s*(?:<custom[^>]*>.*?<\/custom>\s*)*/g;
+    while ((match = boldPattern.exec(body)) !== null) {
+      const heading = match[1].replace(/<custom[^>]*>.*?<\/custom>/g, '').trim();
+      if (heading && !heading.match(/^(?:Epic|Highlights|Week of|Status|Blockers|Cross-team|Customer|Delivery)/i) && heading.length > 5) {
+        lines.push(`• ${heading}`);
+        if (lines.length >= 3) break;
+      }
+    }
+  }
+
+  // If still nothing, try ### headings
+  if (lines.length === 0) {
+    const h3Pattern = /###\s*(?:🥇|🥈|🥉)?\s*(.+?)(?:\n|$)/g;
+    while ((match = h3Pattern.exec(body)) !== null) {
+      const heading = match[1].replace(/\*\*/g, '').replace(/<custom[^>]*>.*?<\/custom>/g, '').trim();
+      if (heading && !heading.match(/^(?:Highlights|Blockers|Cross-team|Customer|Delivery)/i)) {
+        lines.push(`• ${heading}`);
+        if (lines.length >= 3) break;
+      }
+    }
+  }
+
+  return lines.slice(0, 3).join('\n');
+}
+
+/** Group JIRA tickets by team key using project-to-team mapping */
+function groupByTeam(tickets: JiraTicket[]): Map<string, JiraTicket[]> {
+  const byTeam = new Map<string, JiraTicket[]>();
+  for (const t of tickets) {
+    const project = (t.frontmatter?.project as string) || '';
+    const teamKey = PROJECT_TO_TEAM[project] || 'other';
+    if (!byTeam.has(teamKey)) byTeam.set(teamKey, []);
+    byTeam.get(teamKey)!.push(t);
+  }
+  return byTeam;
+}
+
 function extractCustomerIssues(report: StatusReport): string[] {
   const issues: string[] = [];
   const body = report.body;
@@ -252,6 +325,18 @@ function extractCustomerIssues(report: StatusReport): string[] {
 
 // --- Report generation ---
 
+interface TeamSignals {
+  blockers: string[];
+  risks: string[];
+  wins: string[];
+  snippet: string;
+  blockedTickets: JiraTicket[];
+  p0Tickets: JiraTicket[];
+  p1Tickets: JiraTicket[];
+  customerInvestigations: JiraTicket[];
+  unreportedBlocked: JiraTicket[];
+}
+
 function generateRollup(
   reports: Map<string, StatusReport>,
   blockedTickets: JiraTicket[],
@@ -262,86 +347,87 @@ function generateRollup(
   const dateStr = today.toISOString().slice(0, 10);
   const weekday = today.toLocaleDateString('en-US', { weekday: 'long' });
 
-  // Collect all signals
-  const needsAttention: string[] = [];
-  const watchList: string[] = [];
-  const wins: string[] = [];
-  const teamLines: string[] = [];
+  // Group JIRA data by team
+  const blockedByTeam = groupByTeam(blockedTickets);
+  const highPriorityByTeam = groupByTeam(highPriority);
+  const customerByTeam = groupByTeam(customerIssues);
+
+  // Build reported JIRA keys set (what's mentioned in status reports)
+  const reportedKeys = new Set<string>();
+  for (const [, report] of reports) {
+    const refs = report.frontmatter?.jira_refs as string[] | undefined;
+    if (refs) refs.forEach(r => reportedKeys.add(r));
+  }
+
+  // Analyze each team
+  const teamSignals = new Map<string, TeamSignals>();
 
   for (const teamKey of TEAM_ORDER) {
     const report = reports.get(teamKey);
-    if (!report) continue;
+    const teamBlocked = blockedByTeam.get(teamKey) || [];
+    const teamHP = highPriorityByTeam.get(teamKey) || [];
+    const teamCI = customerByTeam.get(teamKey) || [];
+    const unreported = teamBlocked.filter(t => !reportedKeys.has(t.frontmatter?.jira_key as string));
 
+    const signals: TeamSignals = {
+      blockers: report ? extractBlockers(report) : [],
+      risks: report ? extractDeliveryRisks(report) : [],
+      wins: report ? extractWins(report) : [],
+      snippet: report ? extractStatusSnippet(report) : 'No status report this week',
+      blockedTickets: teamBlocked,
+      p0Tickets: teamHP.filter(t => (t.frontmatter?.priority as string) === 'P0'),
+      p1Tickets: teamHP.filter(t => (t.frontmatter?.priority as string) === 'P1'),
+      customerInvestigations: teamCI,
+      unreportedBlocked: unreported,
+    };
+
+    teamSignals.set(teamKey, signals);
+  }
+
+  // --- Build cross-cutting summary ---
+  const needsAttention: string[] = [];
+  const watchList: string[] = [];
+
+  for (const teamKey of TEAM_ORDER) {
     const teamName = TEAM_DISPLAY[teamKey] || teamKey;
-    const blockers = extractBlockers(report);
-    const risks = extractDeliveryRisks(report);
-    const teamWins = extractWins(report);
-    const oneLiner = extractOneLineStatus(report);
-    const custIssues = extractCustomerIssues(report);
+    const signals = teamSignals.get(teamKey)!;
 
-    // Needs attention: blockers and critical risks
-    for (const b of blockers) {
+    // NEEDS ATTENTION: blockers from status reports
+    for (const b of signals.blockers) {
       needsAttention.push(`*${teamName}:* ${b}`);
     }
+    // NEEDS ATTENTION: P0 tickets
+    if (signals.p0Tickets.length > 0) {
+      const keys = signals.p0Tickets.map(t => t.frontmatter?.jira_key).join(', ');
+      needsAttention.push(`*${teamName}:* ${signals.p0Tickets.length} open P0 — ${keys}`);
+    }
+    // NEEDS ATTENTION: blocked tickets not in status reports
+    if (signals.unreportedBlocked.length > 0) {
+      const keys = signals.unreportedBlocked.slice(0, 3).map(t => t.frontmatter?.jira_key).join(', ');
+      const more = signals.unreportedBlocked.length > 3 ? ` +${signals.unreportedBlocked.length - 3} more` : '';
+      needsAttention.push(`*${teamName}:* ${signals.unreportedBlocked.length} blocked tickets not in status report — ${keys}${more}`);
+    }
 
-    // Watch list: delivery risks
-    for (const r of risks) {
+    // WATCH LIST: delivery risks
+    for (const r of signals.risks) {
       watchList.push(`*${teamName}:* ${r}`);
     }
-
-    // Wins
-    for (const w of teamWins.slice(0, 2)) {
-      wins.push(`*${teamName}:* ${w}`);
+    // WATCH LIST: P1 tickets
+    if (signals.p1Tickets.length > 0) {
+      watchList.push(`*${teamName}:* ${signals.p1Tickets.length} open P1 tickets`);
     }
-
-    // Team one-liner
-    const blockerNote = blockers.length > 0 ? ` ⚠️ ${blockers.length} blocker${blockers.length > 1 ? 's' : ''}` : '';
-    teamLines.push(`• *${teamName}:* ${oneLiner}${blockerNote}`);
-  }
-
-  // Add blocked JIRA tickets not already covered in status reports
-  if (blockedTickets.length > 0) {
-    const reportedKeys = new Set<string>();
-    for (const [, report] of reports) {
-      const refs = report.frontmatter?.jira_refs as string[] | undefined;
-      if (refs) refs.forEach(r => reportedKeys.add(r));
+    // WATCH LIST: unassigned customer investigations
+    const unassignedCI = signals.customerInvestigations.filter(t => !t.frontmatter?.assignee);
+    if (unassignedCI.length > 0) {
+      watchList.push(`*${teamName}:* ${unassignedCI.length} unassigned customer investigation${unassignedCI.length > 1 ? 's' : ''}`);
     }
-
-    const unreported = blockedTickets.filter(t => {
-      const key = (t.frontmatter?.jira_key as string) || '';
-      return !reportedKeys.has(key);
-    });
-
-    if (unreported.length > 0) {
-      needsAttention.push(`*JIRA:* ${unreported.length} blocked ticket${unreported.length > 1 ? 's' : ''} not mentioned in status reports`);
-    }
-  }
-
-  // Add P0/P1 tickets
-  if (highPriority.length > 0) {
-    const p0 = highPriority.filter(t => (t.frontmatter?.priority as string) === 'P0');
-    const p1 = highPriority.filter(t => (t.frontmatter?.priority as string) === 'P1');
-    if (p0.length > 0) {
-      needsAttention.push(`*Critical:* ${p0.length} open P0 ticket${p0.length > 1 ? 's' : ''}: ${p0.slice(0, 3).map(t => t.frontmatter?.jira_key).join(', ')}${p0.length > 3 ? '...' : ''}`);
-    }
-    if (p1.length > 0) {
-      watchList.push(`*High Priority:* ${p1.length} open P1 ticket${p1.length > 1 ? 's' : ''} across OCP`);
-    }
-  }
-
-  // Add open customer investigations
-  if (customerIssues.length > 0) {
-    const unassigned = customerIssues.filter(t => !t.frontmatter?.assignee);
-    if (unassigned.length > 0) {
-      watchList.push(`*Customer:* ${unassigned.length} unassigned customer investigation${unassigned.length > 1 ? 's' : ''}`);
-    }
-    watchList.push(`*Customer:* ${customerIssues.length} open customer investigation${customerIssues.length > 1 ? 's' : ''} total`);
   }
 
   // --- Build the report ---
   let report = `📋 *OCP Weekly Rollup — ${dateStr}*\n`;
   report += `_${reports.size} teams reporting | Data as of ${weekday}_\n`;
 
+  // Cross-cutting alerts
   if (needsAttention.length > 0) {
     report += `\n🔴 *NEEDS ATTENTION*\n`;
     for (const item of needsAttention) {
@@ -358,20 +444,75 @@ function generateRollup(
     }
   }
 
-  if (wins.length > 0) {
-    report += `\n🟢 *WINS*\n`;
-    for (const item of wins.slice(0, 10)) {
-      report += `${item}\n`;
+  // Per-team sections
+  report += `\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
+
+  for (const teamKey of TEAM_ORDER) {
+    const teamName = TEAM_DISPLAY[teamKey] || teamKey;
+    const signals = teamSignals.get(teamKey)!;
+    const statusReport = reports.get(teamKey);
+
+    // Team header with status indicator
+    let indicator = '🟢';
+    if (signals.blockers.length > 0 || signals.p0Tickets.length > 0) indicator = '🔴';
+    else if (signals.risks.length > 0 || signals.unreportedBlocked.length > 0 || signals.p1Tickets.length > 5) indicator = '🟡';
+
+    report += `\n${indicator} *${teamName}*`;
+    if (statusReport) report += ` _(${statusReport.date})_`;
+    report += `\n`;
+
+    // Status snippet (priorities)
+    if (signals.snippet) {
+      report += `${signals.snippet}\n`;
+    }
+
+    // Blockers inline
+    if (signals.blockers.length > 0) {
+      report += `⚠️ *Blockers:*\n`;
+      for (const b of signals.blockers) {
+        report += `  • ${b}\n`;
+      }
+    }
+
+    // Delivery risks inline
+    if (signals.risks.length > 0) {
+      report += `⏳ *Risks:*\n`;
+      for (const r of signals.risks) {
+        report += `  • ${r}\n`;
+      }
+    }
+
+    // JIRA signals
+    const jiraSignals: string[] = [];
+    if (signals.p0Tickets.length > 0) {
+      jiraSignals.push(`${signals.p0Tickets.length} P0`);
+    }
+    if (signals.p1Tickets.length > 0) {
+      jiraSignals.push(`${signals.p1Tickets.length} P1`);
+    }
+    if (signals.blockedTickets.length > 0) {
+      jiraSignals.push(`${signals.blockedTickets.length} blocked`);
+    }
+    if (signals.customerInvestigations.length > 0) {
+      const unassigned = signals.customerInvestigations.filter(t => !t.frontmatter?.assignee).length;
+      const ciStr = `${signals.customerInvestigations.length} customer investigation${signals.customerInvestigations.length > 1 ? 's' : ''}`;
+      jiraSignals.push(unassigned > 0 ? `${ciStr} (${unassigned} unassigned)` : ciStr);
+    }
+    if (jiraSignals.length > 0) {
+      report += `📎 _JIRA: ${jiraSignals.join(' · ')}_\n`;
+    }
+
+    // Wins
+    if (signals.wins.length > 0) {
+      report += `✅ ${signals.wins.slice(0, 3).join(' · ')}\n`;
     }
   }
 
-  report += `\n📊 *TEAM STATUS*\n`;
-  for (const line of teamLines) {
-    report += `${line}\n`;
-  }
-
   // Stats footer
-  report += `\n_${blockedTickets.length} blocked tickets | ${highPriority.length} open P0/P1 | ${customerIssues.length} open customer investigations_`;
+  const totalP0 = highPriority.filter(t => (t.frontmatter?.priority as string) === 'P0').length;
+  const totalP1 = highPriority.filter(t => (t.frontmatter?.priority as string) === 'P1').length;
+  report += `\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
+  report += `_${blockedTickets.length} blocked · ${totalP0} P0 · ${totalP1} P1 · ${customerIssues.length} customer investigations_`;
 
   return report;
 }
