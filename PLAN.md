@@ -127,7 +127,19 @@ These are the PM-facing query skills that make the brain useful:
 - Consolidates by team/epic/sprint
 - Replaces chasing PMs across channels for status updates
 
-### Phase 6: PRD toolkit integration
+### Phase 6: Email ingestion (backlog — needs IT approval)
+Email ingestion would enable forwarding Granola meeting notes, customer emails, and internal context to the brain. gbrain's email-to-brain recipe uses Gmail API via OAuth (credential-gateway recipe). Requires IT to whitelist the OAuth app.
+
+**Use cases:**
+- Forward Granola meeting notes after customer calls
+- Forward customer emails (feature requests, complaints, executive escalations)
+- Forward internal emails with decisions/approvals worth preserving
+
+**Workaround until approved:** Slack 🧠 reaction covers the same use case — people paste emails into Slack and react with 🧠. Confluence "Brain Feed" space is another fallback.
+
+**When IT approves:** Set up `brain@yourcompany.com` as a shared inbox. Anyone on the team can forward to it. gbrain's existing email-to-brain recipe polls and ingests.
+
+### Phase 7: PRD toolkit integration
 Wire gbrain to PagerDuty/prd-toolkit so PRDs are grounded in real customer data.
 
 **prd-prep skill** — generates a research package for any topic by querying the brain
@@ -157,6 +169,8 @@ Wire gbrain to PagerDuty/prd-toolkit so PRDs are grounded in real customer data.
 ### Identified as missing (future)
 | Source | What it would give us | Why it matters for PRDs |
 |---|---|---|
+| Granola meeting notes | AI summaries + transcripts of customer calls | Richer than Gong alone; needs email ingestion (Phase 6) or Granola API (Business/Enterprise plan) |
+| Email (Gmail) | Forwarded customer emails, Granola notes, internal decisions | Needs IT to whitelist Gmail OAuth app (Phase 6) |
 | Product analytics (Amplitude/Mixpanel/Pendo) | Feature usage, adoption, drop-off funnels | "Are customers actually using what we built?" |
 | Revenue/finance data | ARR by segment, expansion/churn correlation | "What's this feature worth?" for prioritization |
 | Competitive intelligence (G2, Gartner, competitor changelogs) | What customers compare us to, market gaps | "What are alternatives doing?" |
