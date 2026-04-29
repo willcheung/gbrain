@@ -181,6 +181,10 @@ function inferType(filePath?: string): PageType {
   if (lower.includes('/features/') || lower.includes('/feature/')) return 'feature';
   if (lower.includes('/calls/') || lower.includes('/call/')) return 'call';
   if (lower.includes('/status/') || lower.includes('/status-reports/')) return 'status';
+  if (lower.includes('/ideas/') || lower.includes('/idea/')) return 'idea';
+  if (lower.includes('/accounts/') || lower.includes('/account/')) return 'account';
+  if (lower.includes('/themes/') || lower.includes('/theme/')) return 'theme';
+  if (lower.includes('/wiki/gong/')) return 'synthesis';
   return 'concept';
 }
 
