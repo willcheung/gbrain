@@ -3,7 +3,7 @@
 // ingest (and the amara-life-v1 eval corpus in the sibling gbrain-evals repo).
 // Previously these collapsed into `source`, which lost workflow semantics
 // (e.g. "attended meetings" vs "received emails").
-export type PageType = 'person' | 'company' | 'deal' | 'yc' | 'civic' | 'project' | 'concept' | 'source' | 'media' | 'writing' | 'analysis' | 'guide' | 'hardware' | 'architecture' | 'meeting' | 'note' | 'email' | 'slack' | 'calendar-event' | 'ticket' | 'feature' | 'call' | 'status';
+export type PageType = 'person' | 'company' | 'deal' | 'yc' | 'civic' | 'project' | 'concept' | 'source' | 'media' | 'writing' | 'analysis' | 'guide' | 'hardware' | 'architecture' | 'meeting' | 'note' | 'email' | 'slack' | 'calendar-event' | 'ticket' | 'feature' | 'call' | 'status' | 'idea' | 'account' | 'synthesis' | 'theme';
 
 export interface Page {
   id: number;
