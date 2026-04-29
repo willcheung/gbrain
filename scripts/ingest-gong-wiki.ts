@@ -124,8 +124,16 @@ function normalizeCompanyName(name: string): string {
     .toLowerCase()
     // strip parentheticals
     .replace(/\s*\(.*?\)/g, '')
+    // take first part of slash-separated names: "Musarubra / SkyHigh Security" → "Musarubra"
+    .replace(/\s*\/\s*.+$/, '')
     // strip common suffixes
-    .replace(/\b(inc|llc|ltd|corp|gmbh|plc|limited|corporation|lp|co)\b\.?/gi, '')
+    .replace(/\b(inc|llc|ltd|corp|gmbh|plc|limited|corporation|lp|co|nv|sa|ag|group|holdings|us|usa)\b\.?/gi, '')
+    // strip trailing country/region codes: ", NV", ", US"
+    .replace(/,\s*[a-z]{2,3}$/i, '')
+    // collapse "In Bev" → "inbev" style spacing variants
+    .replace(/\bin\s+bev\b/gi, 'inbev')
+    // strip remaining punctuation (commas, dots, dashes become spaces)
+    .replace(/[,.\-]+/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
 }
@@ -431,8 +439,56 @@ async function main() {
     console.log(`  ${brainNameIndex.size} normalized brain account names indexed`);
 
     // Match wiki customers to brain accounts
+    // Pass 1: exact normalized match
+    // Pass 2: "starts with" fallback (wiki name is prefix of UV name, or vice versa)
+    // Pass 3: slash-separated aliases (e.g. "Musarubra / SkyHigh Security" tries "SkyHigh Security")
     for (const wc of wikiCustomers) {
-      const brainSlug = brainNameIndex.get(wc.normalizedName);
+      let brainSlug = brainNameIndex.get(wc.normalizedName);
+
+      // Pass 2: starts-with fallback
+      if (!brainSlug) {
+        for (const [norm, slug] of brainNameIndex) {
+          if (norm.startsWith(wc.normalizedName) || wc.normalizedName.startsWith(norm)) {
+            // Only match if the shorter string is at least 4 chars (avoid "box" matching "boxing")
+            const shorter = norm.length < wc.normalizedName.length ? norm : wc.normalizedName;
+            if (shorter.length >= 4) {
+              brainSlug = slug;
+              break;
+            }
+          }
+        }
+      }
+
+      // Pass 2b: try splitting compound words ("foxcorp" → "fox")
+      if (!brainSlug) {
+        // Split camelCase-ish compounds and try first word
+        const firstWord = wc.normalizedName.split(/\s+/)[0];
+        if (firstWord.length >= 4) {
+          for (const [norm, slug] of brainNameIndex) {
+            if (norm === firstWord || norm.startsWith(firstWord + ' ')) {
+              brainSlug = slug;
+              break;
+            }
+          }
+        }
+      }
+
+      // Pass 3: try slash-separated alias (second part)
+      if (!brainSlug && wc.name.includes('/')) {
+        const alias = wc.name.split('/').pop()!.trim();
+        const aliasNorm = normalizeCompanyName(alias);
+        brainSlug = brainNameIndex.get(aliasNorm);
+        if (!brainSlug) {
+          // starts-with on alias too
+          for (const [norm, slug] of brainNameIndex) {
+            if ((norm.startsWith(aliasNorm) || aliasNorm.startsWith(norm)) && aliasNorm.length >= 5) {
+              brainSlug = slug;
+              break;
+            }
+          }
+        }
+      }
+
       if (brainSlug) {
         customerSlugMap.set(wc.wikiSlug, brainSlug);
         matchedCustomers.push({ wiki: wc, brainSlug });
