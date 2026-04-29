@@ -552,6 +552,59 @@ const list_pages: Operation = {
   cliHints: { name: 'list' },
 };
 
+const list_pages_ranked: Operation = {
+  name: 'list_pages_ranked',
+  description: 'List pages ranked by a numeric frontmatter field',
+  params: {
+    type: { type: 'string', required: true, description: 'Page type to filter' },
+    field: { type: 'string', required: true, description: 'Frontmatter field to sort by (must be numeric)' },
+    order: { type: 'string', description: 'asc or desc (default desc)' },
+    tag: { type: 'string', description: 'Optional tag filter' },
+    min_value: { type: 'number', description: 'Minimum field value (filters nulls)' },
+    limit: { type: 'number', description: 'Max results (default 20)' },
+  },
+  handler: async (ctx, p) => {
+    const type = p.type as string;
+    const field = p.field as string;
+    const order = (p.order as string) === 'asc' ? 'asc' : 'desc';
+    const limit = clampSearchLimit(p.limit as number | undefined, 20, 100);
+    const minValue = p.min_value as number | undefined;
+    const tag = p.tag as string | undefined;
+
+    const sql = (ctx.engine as any).sql;
+    if (!sql) throw new OperationError('not_supported', 'list_pages_ranked requires Postgres engine');
+
+    const typeCondition = sql`AND p.type = ${type}`;
+    const tagJoin = tag ? sql`JOIN tags t ON t.page_id = p.id` : sql``;
+    const tagCondition = tag ? sql`AND t.tag = ${tag}` : sql``;
+    const minCondition = minValue !== undefined
+      ? sql`AND (p.frontmatter->>${field})::numeric >= ${minValue}`
+      : sql``;
+    const orderClause = order === 'asc'
+      ? sql`ORDER BY (p.frontmatter->>${field})::numeric ASC NULLS LAST`
+      : sql`ORDER BY (p.frontmatter->>${field})::numeric DESC NULLS LAST`;
+
+    const rows = await sql`
+      SELECT p.slug, p.title, p.type, p.frontmatter, p.updated_at
+      FROM pages p
+      ${tagJoin}
+      WHERE p.frontmatter->>${field} IS NOT NULL
+      ${typeCondition} ${tagCondition} ${minCondition}
+      ${orderClause}
+      LIMIT ${limit}
+    `;
+
+    return rows.map((r: any) => ({
+      slug: r.slug,
+      title: r.title,
+      type: r.type,
+      [field]: r.frontmatter?.[field],
+      updated_at: r.updated_at,
+    }));
+  },
+  cliHints: { name: 'rank', positional: [] },
+};
+
 // --- Search ---
 
 const search: Operation = {
@@ -1301,7 +1354,7 @@ const find_orphans: Operation = {
 
 export const operations: Operation[] = [
   // Page CRUD
-  get_page, put_page, delete_page, list_pages,
+  get_page, put_page, delete_page, list_pages, list_pages_ranked,
   // Search
   search, query,
   // Tags
