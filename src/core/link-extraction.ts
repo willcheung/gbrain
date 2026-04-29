@@ -44,7 +44,7 @@ export type LinkResolutionType = 'qualified' | 'unqualified';
  *   - Our domain extensions: tech, finance, personal, openclaw (domain-organized wikis)
  *   - Our entity prefix: entities (we kept some legacy entities/projects/ pages)
  */
-const DIR_PATTERN = '(?:people|companies|meetings|concepts|deal|civic|project|projects|source|media|yc|tech|finance|personal|openclaw|entities|tickets|features|calls|status)';
+const DIR_PATTERN = '(?:people|companies|meetings|concepts|deal|civic|project|projects|source|media|yc|tech|finance|personal|openclaw|entities|tickets|features|calls|status|ideas|accounts|themes|wiki)';
 
 /**
  * Match `[Name](path)` markdown links pointing to entity directories.
@@ -585,12 +585,30 @@ export const FRONTMATTER_LINK_MAP: FrontmatterFieldMapping[] = [
   // Call pages (Gong calls, customer meetings): participants and account
   { fields: ['participants', 'attendees'], pageType: 'call', type: 'had_call', direction: 'incoming', dirHint: 'people' },
   { fields: ['account', 'customer_account'], pageType: 'call', type: 'is_customer_of', direction: 'outgoing', dirHint: 'companies' },
+  // Call pages (Gong): customer field (alias for account/customer_account used by Gong wiki)
+  { fields: ['customer'], pageType: 'call', type: 'had_call', direction: 'incoming', dirHint: ['companies', 'accounts'] },
   // Company/account pages: customer relationship, renewal/churn status
   { fields: ['customers', 'customer_contacts'], pageType: 'company', type: 'is_customer_of', direction: 'incoming', dirHint: 'people' },
   { fields: ['account_owner', 'csm'], pageType: 'company', type: 'works_at', direction: 'incoming', dirHint: 'people' },
   // Status report pages (from JIRA)
   { fields: ['owner', 'assignee'], pageType: 'status', type: 'works_at', direction: 'incoming', dirHint: 'people' },
   { fields: ['related_tickets'], pageType: 'status', type: 'related_to', direction: 'outgoing', dirHint: 'tickets' },
+  // Status reports → JIRA tickets mentioned (from jira_refs frontmatter)
+  { fields: ['jira_refs'], pageType: 'status', type: 'mentions', direction: 'outgoing', dirHint: 'tickets/jira' },
+  // Status reports → customer accounts referenced
+  { fields: ['customers'], pageType: 'status', type: 'is_customer_of', direction: 'outgoing', dirHint: ['accounts', 'companies'] },
+  // Status reports → people mentioned (assignees, authors)
+  { fields: ['people_mentioned'], pageType: 'status', type: 'mentions', direction: 'outgoing', dirHint: 'people' },
+
+  // ─── Idea pages (UserVoice) ──────────────────────────────────
+  //
+  // voting_accounts: account names that voted for this idea. Direction is
+  // incoming because the account is the subject ("account voted_for idea")
+  // but the field lives on the idea page.
+  { fields: ['voting_accounts'], pageType: 'idea', type: 'voted_for', direction: 'incoming', dirHint: 'accounts' },
+  // linked_jira: JIRA keys this idea tracks. Multi-level dirHint because
+  // ticket slugs are tickets/jira/{key}, not tickets/{key}.
+  { fields: ['linked_jira'], pageType: 'idea', type: 'tracks_ticket', direction: 'outgoing', dirHint: 'tickets/jira' },
 
   // Any page type
   { fields: ['sources'], type: 'discussed_in', direction: 'incoming', dirHint: ['source', 'media'] },
