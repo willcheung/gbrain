@@ -414,7 +414,7 @@ async function main() {
   if (!dryRun) {
     // Load all account pages for matching
     console.log('  Loading brain account pages...');
-    const accountPages = await engine.listPages({ type: 'account' });
+    const accountPages = await engine.listPages({ type: 'account', limit: 10000 });
     console.log(`  ${accountPages.length} account pages loaded`);
 
     // Build normalized name → brain slug index
