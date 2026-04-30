@@ -4,10 +4,12 @@
  *
  * Usage:
  *   DATABASE_URL="postgresql://wcheung@localhost/gbrain" bun scripts/weekly-rollup.ts
- *   DATABASE_URL="..." bun scripts/weekly-rollup.ts --slack   # Also post to Slack
- *   DATABASE_URL="..." bun scripts/weekly-rollup.ts --json    # Output raw JSON
+ *   DATABASE_URL="..." bun scripts/weekly-rollup.ts --slack       # Also post to Slack
+ *   DATABASE_URL="..." bun scripts/weekly-rollup.ts --confluence  # Post to Confluence
+ *   DATABASE_URL="..." bun scripts/weekly-rollup.ts --json        # Output raw JSON
  *
  * Requires SLACK_WEBHOOK_URL env var for --slack mode.
+ * Requires ATLASSIAN_EMAIL + ATLASSIAN_API_TOKEN env vars for --confluence mode.
  *
  * What it produces:
  *   1. 🔴 NEEDS ATTENTION — blocked items, slipping deadlines, delivery risks
@@ -44,7 +46,7 @@ const PROJECT_TO_TEAM: Record<string, string> = {
   'MNE': 'mne',
   'GBFM': 'appex', 'FEP': 'appex', 'PD': 'appex', 'FEAST': 'appex',
   'AUTH': 'authnz',
-  'INTGR': 'integrations', 'CSOT': 'integrations',
+  'INTGR': 'integrations',
 };
 
 interface StatusReport {
@@ -111,6 +113,92 @@ async function getBlockedTickets(sql: ReturnType<typeof db.getConnection>): Prom
     ORDER BY frontmatter->>'priority', title
   `;
   return rows.map(rowToTicket);
+}
+
+/** Get the two most recent status reports per team to detect persistently blocked tickets */
+async function getPreviousStatusReports(sql: ReturnType<typeof db.getConnection>): Promise<Map<string, StatusReport>> {
+  const rows = await sql`
+    SELECT slug, title, compiled_truth, frontmatter
+    FROM pages
+    WHERE type = 'status'
+      AND slug LIKE 'status/ocp/%'
+    ORDER BY slug DESC
+  `;
+
+  // Collect all reports per team sorted by date desc, then pick the second one
+  const allByTeam = new Map<string, StatusReport[]>();
+  for (const r of rows) {
+    const fm = typeof r.frontmatter === 'string' ? JSON.parse(r.frontmatter) : (r.frontmatter || {});
+    const teamKey = fm?.team_key || r.slug.split('/')[2]?.replace(/-\d{4}-\d{2}-\d{2}$/, '');
+    const date = fm?.date || 'unknown';
+    if (date === 'unknown') continue;
+    if (!allByTeam.has(teamKey)) allByTeam.set(teamKey, []);
+    allByTeam.get(teamKey)!.push({
+      slug: r.slug,
+      title: r.title,
+      body: r.compiled_truth || '',
+      team: fm?.team || TEAM_DISPLAY[teamKey] || teamKey,
+      teamKey,
+      date,
+      frontmatter: fm,
+    });
+  }
+
+  const previous = new Map<string, StatusReport>();
+  for (const [teamKey, reports] of allByTeam) {
+    // Sort by date descending, pick the second entry (previous week)
+    reports.sort((a, b) => b.date.localeCompare(a.date));
+    if (reports.length >= 2) {
+      previous.set(teamKey, reports[1]);
+    }
+  }
+  return previous;
+}
+
+/** Find tickets that are blocked NOW and were also mentioned in the previous week's status report */
+function findPersistentlyBlocked(
+  blockedTickets: JiraTicket[],
+  currentReports: Map<string, StatusReport>,
+  previousReports: Map<string, StatusReport>,
+): JiraTicket[] {
+  // Build a set of JIRA keys mentioned in previous week's reports
+  const prevReportedKeys = new Set<string>();
+  for (const [, report] of previousReports) {
+    const refs = report.frontmatter?.jira_refs as string[] | undefined;
+    if (refs) refs.forEach(r => prevReportedKeys.add(r));
+    // Also scan body for JIRA keys in case jira_refs is incomplete
+    const bodyKeys = report.body.match(/\b[A-Z][A-Z0-9]+-\d+\b/g);
+    if (bodyKeys) bodyKeys.forEach(k => prevReportedKeys.add(k));
+  }
+
+  // Also build set for current week
+  const currReportedKeys = new Set<string>();
+  for (const [, report] of currentReports) {
+    const refs = report.frontmatter?.jira_refs as string[] | undefined;
+    if (refs) refs.forEach(r => currReportedKeys.add(r));
+    const bodyKeys = report.body.match(/\b[A-Z][A-Z0-9]+-\d+\b/g);
+    if (bodyKeys) bodyKeys.forEach(k => currReportedKeys.add(k));
+  }
+
+  // A ticket is persistently blocked if:
+  // 1. It's currently Blocked in JIRA, AND
+  // 2. It was mentioned in BOTH current and previous week's reports (known about for >1 week), OR
+  // 3. Its JIRA 'updated' date is >7 days old (stale-blocked, no progress)
+  const sevenDaysAgo = new Date();
+  sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
+  const cutoff = sevenDaysAgo.toISOString().slice(0, 10);
+
+  return blockedTickets.filter(t => {
+    const key = t.frontmatter?.jira_key as string;
+    const updated = t.frontmatter?.updated as string;
+
+    // Mentioned in both weeks = team has known about it for 2+ report cycles
+    const inBothWeeks = prevReportedKeys.has(key) && currReportedKeys.has(key);
+    // Stale: last JIRA update >7 days ago while still blocked
+    const staleBlocked = updated && updated < cutoff;
+
+    return inBothWeeks || staleBlocked;
+  });
 }
 
 async function getHighPriorityOpen(sql: ReturnType<typeof db.getConnection>): Promise<JiraTicket[]> {
@@ -325,6 +413,18 @@ function extractCustomerIssues(report: StatusReport): string[] {
 
 // --- Report generation ---
 
+const JIRA_BROWSE = 'https://pagerduty.atlassian.net/browse';
+
+/** Turn a JIRA key into a markdown link */
+function jiraLink(key: string): string {
+  return `[${key}](${JIRA_BROWSE}/${key})`;
+}
+
+/** Turn a JIRA key into a linked key, or pass through if not a key */
+function linkifyJiraKeys(text: string): string {
+  return text.replace(/\b([A-Z][A-Z0-9]+-\d+)\b/g, (_, key) => jiraLink(key));
+}
+
 interface TeamSignals {
   blockers: string[];
   risks: string[];
@@ -335,6 +435,7 @@ interface TeamSignals {
   p1Tickets: JiraTicket[];
   customerInvestigations: JiraTicket[];
   unreportedBlocked: JiraTicket[];
+  persistentlyBlocked: JiraTicket[];
 }
 
 function generateRollup(
@@ -342,6 +443,7 @@ function generateRollup(
   blockedTickets: JiraTicket[],
   highPriority: JiraTicket[],
   customerIssues: JiraTicket[],
+  persistentlyBlocked: JiraTicket[],
 ): string {
   const today = new Date();
   const dateStr = today.toISOString().slice(0, 10);
@@ -351,6 +453,7 @@ function generateRollup(
   const blockedByTeam = groupByTeam(blockedTickets);
   const highPriorityByTeam = groupByTeam(highPriority);
   const customerByTeam = groupByTeam(customerIssues);
+  const persistentByTeam = groupByTeam(persistentlyBlocked);
 
   // Build reported JIRA keys set (what's mentioned in status reports)
   const reportedKeys = new Set<string>();
@@ -367,6 +470,7 @@ function generateRollup(
     const teamBlocked = blockedByTeam.get(teamKey) || [];
     const teamHP = highPriorityByTeam.get(teamKey) || [];
     const teamCI = customerByTeam.get(teamKey) || [];
+    const teamPersistent = persistentByTeam.get(teamKey) || [];
     const unreported = teamBlocked.filter(t => !reportedKeys.has(t.frontmatter?.jira_key as string));
 
     const signals: TeamSignals = {
@@ -379,119 +483,54 @@ function generateRollup(
       p1Tickets: teamHP.filter(t => (t.frontmatter?.priority as string) === 'P1'),
       customerInvestigations: teamCI,
       unreportedBlocked: unreported,
+      persistentlyBlocked: teamPersistent,
     };
 
     teamSignals.set(teamKey, signals);
   }
 
-  // --- Build cross-cutting summary ---
-  const needsAttention: string[] = [];
-  const watchList: string[] = [];
-
-  for (const teamKey of TEAM_ORDER) {
-    const teamName = TEAM_DISPLAY[teamKey] || teamKey;
-    const signals = teamSignals.get(teamKey)!;
-
-    // NEEDS ATTENTION: blockers from status reports
-    for (const b of signals.blockers) {
-      needsAttention.push(`*${teamName}:* ${b}`);
-    }
-    // NEEDS ATTENTION: P0 tickets
-    if (signals.p0Tickets.length > 0) {
-      const keys = signals.p0Tickets.map(t => t.frontmatter?.jira_key).join(', ');
-      needsAttention.push(`*${teamName}:* ${signals.p0Tickets.length} open P0 — ${keys}`);
-    }
-    // NEEDS ATTENTION: blocked tickets not in status reports
-    if (signals.unreportedBlocked.length > 0) {
-      const keys = signals.unreportedBlocked.slice(0, 3).map(t => t.frontmatter?.jira_key).join(', ');
-      const more = signals.unreportedBlocked.length > 3 ? ` +${signals.unreportedBlocked.length - 3} more` : '';
-      needsAttention.push(`*${teamName}:* ${signals.unreportedBlocked.length} blocked tickets not in status report — ${keys}${more}`);
-    }
-
-    // WATCH LIST: delivery risks
-    for (const r of signals.risks) {
-      watchList.push(`*${teamName}:* ${r}`);
-    }
-    // WATCH LIST: P1 tickets
-    if (signals.p1Tickets.length > 0) {
-      watchList.push(`*${teamName}:* ${signals.p1Tickets.length} open P1 tickets`);
-    }
-    // WATCH LIST: unassigned customer investigations
-    const unassignedCI = signals.customerInvestigations.filter(t => !t.frontmatter?.assignee);
-    if (unassignedCI.length > 0) {
-      watchList.push(`*${teamName}:* ${unassignedCI.length} unassigned customer investigation${unassignedCI.length > 1 ? 's' : ''}`);
-    }
-  }
-
   // --- Build the report ---
-  let report = `📋 *OCP Weekly Rollup — ${dateStr}*\n`;
+  let report = `📋 *${dateStr} — OCP Weekly Rollup*\n`;
   report += `_${reports.size} teams reporting | Data as of ${weekday}_\n`;
 
-  // Cross-cutting alerts
-  if (needsAttention.length > 0) {
-    report += `\n🔴 *NEEDS ATTENTION*\n`;
-    for (const item of needsAttention) {
-      report += `${item}\n`;
-    }
-  } else {
-    report += `\n🔴 *NEEDS ATTENTION*\nNone — all clear this week.\n`;
-  }
-
-  if (watchList.length > 0) {
-    report += `\n🟡 *WATCH LIST*\n`;
-    for (const item of watchList) {
-      report += `${item}\n`;
-    }
-  }
-
-  // Per-team sections
-  report += `\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
+  // ============================================================
+  // SECTION 1: Team-by-team status (scannable summaries up top)
+  // ============================================================
+  report += `\n`;
 
   for (const teamKey of TEAM_ORDER) {
     const teamName = TEAM_DISPLAY[teamKey] || teamKey;
     const signals = teamSignals.get(teamKey)!;
     const statusReport = reports.get(teamKey);
 
-    // Team header with status indicator
-    let indicator = '🟢';
-    if (signals.blockers.length > 0 || signals.p0Tickets.length > 0) indicator = '🔴';
-    else if (signals.risks.length > 0 || signals.unreportedBlocked.length > 0 || signals.p1Tickets.length > 5) indicator = '🟡';
-
-    report += `\n${indicator} *${teamName}*`;
-    if (statusReport) report += ` _(${statusReport.date})_`;
+    report += `### *${teamName}*`;
+    if (statusReport) {
+      const confUrl = statusReport.frontmatter?.confluence_url as string;
+      if (confUrl) {
+        report += ` _([${statusReport.date}](${confUrl}))_`;
+      } else {
+        report += ` _(${statusReport.date})_`;
+      }
+    }
     report += `\n`;
 
     // Status snippet (priorities)
     if (signals.snippet) {
-      report += `${signals.snippet}\n`;
+      report += `${linkifyJiraKeys(signals.snippet)}\n`;
     }
 
-    // Blockers inline
-    if (signals.blockers.length > 0) {
-      report += `⚠️ *Blockers:*\n`;
-      for (const b of signals.blockers) {
-        report += `  • ${b}\n`;
-      }
+    // Inline delivery risks
+    for (const r of signals.risks) {
+      report += `⚠️ ${linkifyJiraKeys(r)}\n`;
     }
 
-    // Delivery risks inline
-    if (signals.risks.length > 0) {
-      report += `⏳ *Risks:*\n`;
-      for (const r of signals.risks) {
-        report += `  • ${r}\n`;
-      }
-    }
-
-    // JIRA signals
+    // JIRA signal line with traffic light
     const jiraSignals: string[] = [];
-    if (signals.p0Tickets.length > 0) {
-      jiraSignals.push(`${signals.p0Tickets.length} P0`);
-    }
-    if (signals.p1Tickets.length > 0) {
-      jiraSignals.push(`${signals.p1Tickets.length} P1`);
-    }
+    if (signals.p0Tickets.length > 0) jiraSignals.push(`${signals.p0Tickets.length} P0`);
+    if (signals.p1Tickets.length > 0) jiraSignals.push(`${signals.p1Tickets.length} P1`);
     if (signals.blockedTickets.length > 0) {
-      jiraSignals.push(`${signals.blockedTickets.length} blocked`);
+      const persistNote = signals.persistentlyBlocked.length > 0 ? ` (${signals.persistentlyBlocked.length} >1wk)` : '';
+      jiraSignals.push(`${signals.blockedTickets.length} blocked${persistNote}`);
     }
     if (signals.customerInvestigations.length > 0) {
       const unassigned = signals.customerInvestigations.filter(t => !t.frontmatter?.assignee).length;
@@ -499,20 +538,129 @@ function generateRollup(
       jiraSignals.push(unassigned > 0 ? `${ciStr} (${unassigned} unassigned)` : ciStr);
     }
     if (jiraSignals.length > 0) {
-      report += `📎 _JIRA: ${jiraSignals.join(' · ')}_\n`;
+      let indicator = '🟢';
+      if (signals.blockers.length > 0 || signals.p0Tickets.length > 0) indicator = '🔴';
+      else if (signals.risks.length > 0 || signals.unreportedBlocked.length > 0 || signals.persistentlyBlocked.length > 0) indicator = '🟡';
+      report += `${indicator} _JIRA: ${jiraSignals.join(' · ')}_\n`;
     }
 
-    // Wins
-    if (signals.wins.length > 0) {
-      report += `✅ ${signals.wins.slice(0, 3).join(' · ')}\n`;
+    report += `\n`;
+  }
+
+  // ============================================================
+  // SECTION 2: Leadership Action Needed
+  // ============================================================
+  const leadershipAsks: string[] = [];
+  const persistentAsks: string[] = [];
+
+  for (const teamKey of TEAM_ORDER) {
+    const teamName = TEAM_DISPLAY[teamKey] || teamKey;
+    const signals = teamSignals.get(teamKey)!;
+
+    // Blockers from status reports — these are the explicit asks
+    for (const b of signals.blockers) {
+      leadershipAsks.push(`**${teamName}:** ${linkifyJiraKeys(b)}`);
+    }
+
+    // P0s always need leadership visibility
+    if (signals.p0Tickets.length > 0) {
+      const keys = signals.p0Tickets.map(t => jiraLink(t.frontmatter?.jira_key as string)).join(', ');
+      leadershipAsks.push(`**${teamName}:** ${signals.p0Tickets.length} open P0 — ${keys}`);
+    }
+
+    // Unreported blocked tickets — teams may not realize these need escalation
+    if (signals.unreportedBlocked.length > 0) {
+      const keys = signals.unreportedBlocked.slice(0, 3).map(t => jiraLink(t.frontmatter?.jira_key as string)).join(', ');
+      const more = signals.unreportedBlocked.length > 3 ? ` +${signals.unreportedBlocked.length - 3} more` : '';
+      leadershipAsks.push(`**${teamName}:** ${signals.unreportedBlocked.length} blocked tickets not in status report — ${keys}${more}`);
+    }
+
+    // Persistently blocked — blocked for >1 week, needs escalation
+    if (signals.persistentlyBlocked.length > 0) {
+      const items = signals.persistentlyBlocked.slice(0, 5).map(t => {
+        const key = t.frontmatter?.jira_key as string;
+        const updated = t.frontmatter?.updated as string;
+        const daysStale = updated ? Math.floor((Date.now() - new Date(updated).getTime()) / 86400000) : 0;
+        const staleNote = daysStale > 7 ? ` (${daysStale}d stale)` : '';
+        return `${jiraLink(key)}${staleNote}`;
+      }).join(', ');
+      const more = signals.persistentlyBlocked.length > 5 ? ` +${signals.persistentlyBlocked.length - 5} more` : '';
+      persistentAsks.push(`**${teamName}:** ${signals.persistentlyBlocked.length} blocked >1 week — ${items}${more}`);
+    }
+  }
+
+  report += `---\n\n`;
+  if (leadershipAsks.length > 0) {
+    report += `## 🚨 NEEDS TRIAGE — PM/Dev to follow up\n`;
+    report += `_Blockers, P0s, and unreported blocked tickets that need attention_\n`;
+    for (const item of leadershipAsks) {
+      report += `${item}\n`;
+    }
+  } else {
+    report += `## 🚨 NEEDS TRIAGE — PM/Dev to follow up\nNone — all clear this week.\n`;
+  }
+
+  // Persistently blocked section — tickets stuck for >1 week
+  if (persistentAsks.length > 0) {
+    report += `\n## 🔒 STUCK >1 WEEK — blocked across multiple status reports\n`;
+    report += `_These tickets were blocked last week and are still blocked. Escalation or re-prioritization needed._\n`;
+    for (const item of persistentAsks) {
+      report += `${item}\n`;
+    }
+  }
+
+  // ============================================================
+  // SECTION 3: Watch List
+  // ============================================================
+  const watchList: string[] = [];
+
+  for (const teamKey of TEAM_ORDER) {
+    const teamName = TEAM_DISPLAY[teamKey] || teamKey;
+    const signals = teamSignals.get(teamKey)!;
+
+    // WATCH LIST: P1 tickets
+    if (signals.p1Tickets.length > 0) {
+      watchList.push(`**${teamName}:** ${signals.p1Tickets.length} open P1 tickets`);
+    }
+    // WATCH LIST: unassigned customer investigations
+    const unassignedCI = signals.customerInvestigations.filter(t => !t.frontmatter?.assignee);
+    if (unassignedCI.length > 0) {
+      watchList.push(`**${teamName}:** ${unassignedCI.length} unassigned customer investigation${unassignedCI.length > 1 ? 's' : ''}`);
+    }
+  }
+
+  if (watchList.length > 0) {
+    report += `\n## 🟡 WATCH LIST\n`;
+    for (const item of watchList) {
+      report += `${item}\n`;
+    }
+  }
+
+  // ============================================================
+  // SECTION 4: Wins
+  // ============================================================
+  const allWins: string[] = [];
+  for (const teamKey of TEAM_ORDER) {
+    const teamName = TEAM_DISPLAY[teamKey] || teamKey;
+    const signals = teamSignals.get(teamKey)!;
+    for (const w of signals.wins.slice(0, 3)) {
+      allWins.push(`**${teamName}:** ${linkifyJiraKeys(w)}`);
+    }
+  }
+
+  if (allWins.length > 0) {
+    report += `\n## 🏆 WINS THIS WEEK\n`;
+    for (const w of allWins) {
+      report += `${w}\n`;
     }
   }
 
   // Stats footer
   const totalP0 = highPriority.filter(t => (t.frontmatter?.priority as string) === 'P0').length;
   const totalP1 = highPriority.filter(t => (t.frontmatter?.priority as string) === 'P1').length;
-  report += `\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
-  report += `_${blockedTickets.length} blocked · ${totalP0} P0 · ${totalP1} P1 · ${customerIssues.length} customer investigations_`;
+  report += `\n---\n`;
+  report += `_${blockedTickets.length} blocked (${persistentlyBlocked.length} >1wk) · ${totalP0} P0 · ${totalP1} P1 · ${customerIssues.length} customer investigations_\n`;
+  report += `_Auto-generated by OCP Pulse. Ping Will Cheung with questions._`;
 
   return report;
 }
@@ -525,11 +673,122 @@ function toSlackPayload(report: string): string {
   });
 }
 
+// --- Confluence posting ---
+
+const CONFLUENCE_SITE = 'pagerduty.atlassian.net';
+const CONFLUENCE_SPACE_KEY = 'OCP';
+const WEEKLY_ROLLUPS_PARENT_ID = '5523636627'; // "Weekly Rollups" folder under Team Status Reports
+
+/** Convert the Slack-formatted rollup to clean Confluence markdown */
+function toConfluenceMarkdown(report: string): string {
+  return report
+    .replace(/\*/g, '**')           // Slack bold *text* → markdown **text**
+    .replace(/_([^_]+)_/g, '*$1*')  // Slack italic _text_ → markdown *text*
+    .replace(/━+/g, '---');          // Box-drawing chars → horizontal rule
+}
+
+async function postToConfluence(report: string): Promise<string> {
+  const email = process.env.ATLASSIAN_EMAIL;
+  const token = process.env.ATLASSIAN_API_TOKEN;
+  if (!email || !token) {
+    throw new Error('ATLASSIAN_EMAIL and ATLASSIAN_API_TOKEN required for --confluence');
+  }
+
+  const auth = Buffer.from(`${email}:${token}`).toString('base64');
+  const dateStr = new Date().toISOString().slice(0, 10);
+  const title = `${dateStr} — OCP Weekly Rollup`;
+  const body = toConfluenceMarkdown(report);
+
+  // Check if page already exists (avoid duplicates on re-run)
+  const searchUrl = `https://${CONFLUENCE_SITE}/wiki/api/v2/spaces?keys=${CONFLUENCE_SPACE_KEY}`;
+  const spaceResp = await fetch(searchUrl, {
+    headers: { 'Authorization': `Basic ${auth}`, 'Accept': 'application/json' },
+  });
+  if (!spaceResp.ok) throw new Error(`Confluence space lookup failed: ${spaceResp.status}`);
+  const spaceData = await spaceResp.json() as { results: Array<{ id: string }> };
+  const spaceId = spaceData.results[0]?.id;
+  if (!spaceId) throw new Error('Could not find OCP space');
+
+  // Search for existing page with same title
+  const cql = encodeURIComponent(`title = "${title}" AND space = "${CONFLUENCE_SPACE_KEY}" AND type = page`);
+  const searchResp = await fetch(
+    `https://${CONFLUENCE_SITE}/wiki/rest/api/content?cql=${cql}&expand=version`,
+    { headers: { 'Authorization': `Basic ${auth}`, 'Accept': 'application/json' } },
+  );
+
+  if (searchResp.ok) {
+    const searchData = await searchResp.json() as { results: Array<{ id: string; version: { number: number }; _links: { base: string; webui: string } }> };
+    if (searchData.results.length > 0) {
+      const existing = searchData.results[0];
+      // Update the existing page with fresh content
+      const updateResp = await fetch(
+        `https://${CONFLUENCE_SITE}/wiki/rest/api/content/${existing.id}`,
+        {
+          method: 'PUT',
+          headers: {
+            'Authorization': `Basic ${auth}`,
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+          },
+          body: JSON.stringify({
+            id: existing.id,
+            type: 'page',
+            title,
+            version: { number: existing.version.number + 1 },
+            body: {
+              storage: {
+                representation: 'storage',
+                value: `<ac:structured-macro ac:name="markdown"><ac:plain-text-body><![CDATA[${body}]]></ac:plain-text-body></ac:structured-macro>`,
+              },
+            },
+          }),
+        },
+      );
+      if (!updateResp.ok) {
+        const errText = await updateResp.text();
+        throw new Error(`Confluence update failed (${updateResp.status}): ${errText}`);
+      }
+      const url = `https://${CONFLUENCE_SITE}/wiki${existing._links.webui}`;
+      console.log(`Updated existing page: ${url}`);
+      return url;
+    }
+  }
+
+  // Create new page
+  const createResp = await fetch(`https://${CONFLUENCE_SITE}/wiki/api/v2/pages`, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Basic ${auth}`,
+      'Content-Type': 'application/json',
+      'Accept': 'application/json',
+    },
+    body: JSON.stringify({
+      spaceId,
+      title,
+      parentId: WEEKLY_ROLLUPS_PARENT_ID,
+      status: 'current',
+      body: {
+        representation: 'storage',
+        value: `<ac:structured-macro ac:name="markdown"><ac:plain-text-body><![CDATA[${body}]]></ac:plain-text-body></ac:structured-macro>`,
+      },
+    }),
+  });
+
+  if (!createResp.ok) {
+    const errText = await createResp.text();
+    throw new Error(`Confluence create failed (${createResp.status}): ${errText}`);
+  }
+
+  const page = await createResp.json() as { id: string; _links: { webui: string } };
+  return `https://${CONFLUENCE_SITE}/wiki${page._links.webui}`;
+}
+
 // --- Main ---
 
 async function main() {
   const args = process.argv.slice(2);
   const postToSlack = args.includes('--slack');
+  const postToConf = args.includes('--confluence');
   const jsonOutput = args.includes('--json');
 
   const databaseUrl = process.env.DATABASE_URL;
@@ -542,21 +801,26 @@ async function main() {
   const sql = db.getConnection();
 
   // Fetch data
-  const [reports, blockedTickets, highPriority, customerIssues] = await Promise.all([
+  const [reports, blockedTickets, highPriority, customerIssues, previousReports] = await Promise.all([
     getLatestStatusReports(sql),
     getBlockedTickets(sql),
     getHighPriorityOpen(sql),
     getCustomerIssuesOpen(sql),
+    getPreviousStatusReports(sql),
   ]);
 
+  // Detect tickets blocked across two report cycles
+  const persistentlyBlocked = findPersistentlyBlocked(blockedTickets, reports, previousReports);
+
   // Generate report
-  const rollup = generateRollup(reports, blockedTickets, highPriority, customerIssues);
+  const rollup = generateRollup(reports, blockedTickets, highPriority, customerIssues, persistentlyBlocked);
 
   if (jsonOutput) {
     console.log(JSON.stringify({
       date: new Date().toISOString().slice(0, 10),
       teams: reports.size,
       blockedTickets: blockedTickets.length,
+      persistentlyBlocked: persistentlyBlocked.length,
       highPriority: highPriority.length,
       customerIssues: customerIssues.length,
       report: rollup,
@@ -588,6 +852,18 @@ async function main() {
       console.log('✓ Posted to Slack');
     } else {
       console.error(`✗ Slack error: ${resp.status} ${await resp.text()}`);
+      process.exit(1);
+    }
+  }
+
+  // Post to Confluence
+  if (postToConf) {
+    console.log('\nPosting to Confluence...');
+    try {
+      const url = await postToConfluence(rollup);
+      console.log(`✓ Confluence: ${url}`);
+    } catch (err) {
+      console.error(`✗ Confluence error: ${err instanceof Error ? err.message : String(err)}`);
       process.exit(1);
     }
   }
