@@ -2,9 +2,23 @@
 
 > Built on [GBrain](https://github.com/garrytan/gbrain), an open-source AI agent memory system by Garry Tan.
 
-A self-wiring knowledge graph that synthesizes customer pain points, feature requests, and feedback across Gong calls, Salesforce, Zendesk, User Voice, and JIRA. Data lives in Snowflake. The brain makes it queryable in natural language — without writing SQL joins.
+A hybrid knowledge graph + vector database that synthesizes customer pain points, feature requests, and feedback across Gong calls, Salesforce, Zendesk, UserVoice, and JIRA.
 
 Built for product managers who need to find signal from noise. Works for anyone who touches customer data.
+
+## How it works
+
+The brain is both a **graph database** and a **vector database**, running in plain Postgres with pgvector — no separate infrastructure required.
+
+**Vector search** finds content by meaning. Page text is split into chunks and embedded as 1536-dimensional vectors. When you ask "what are customers saying about alert fatigue?", the brain retrieves semantically similar content even if those exact words never appear.
+
+**Graph traversal** follows relationships between entities. Pages are connected by typed edges — an account `voted_for_idea`, a ticket `addresses_theme`, a call `references_jira`. When you find a pain point theme via vector search, the graph tells you which accounts are affected, how much revenue is at stake, and what JIRA tickets track the fix.
+
+**Full-text search** via Postgres tsvector provides fast keyword matching as a third retrieval path. All three are fused using Reciprocal Rank Fusion for best-of-both results.
+
+The three layers work together: vector search surfaces relevant content across thousands of pages, the graph connects that content to accounts, revenue, and roadmap items, and full-text search catches exact matches that embeddings might miss. The result is a system where a single natural language query can traverse from a customer quote in a Gong call to the UserVoice idea it maps to, the accounts requesting it, and the JIRA ticket tracking it — without writing SQL joins.
+
+Everything runs in a single Postgres instance. No Neo4j, no Pinecone, no Weaviate — just Postgres + pgvector doing all three jobs.
 
 ## Use cases for product managers
 
