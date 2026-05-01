@@ -744,6 +744,7 @@ export class PostgresEngine implements BrainEngine {
 
   // Tags
   async addTag(slug: string, tag: string): Promise<void> {
+    slug = validateSlug(slug);
     const sql = this.sql;
     // Verify page exists before attempting insert (ON CONFLICT DO NOTHING
     // swallows the "already tagged" case, but we still need to detect missing pages)
@@ -757,6 +758,7 @@ export class PostgresEngine implements BrainEngine {
   }
 
   async removeTag(slug: string, tag: string): Promise<void> {
+    slug = validateSlug(slug);
     const sql = this.sql;
     await sql`
       DELETE FROM tags
@@ -766,6 +768,7 @@ export class PostgresEngine implements BrainEngine {
   }
 
   async getTags(slug: string): Promise<string[]> {
+    slug = validateSlug(slug);
     const sql = this.sql;
     const rows = await sql`
       SELECT tag FROM tags

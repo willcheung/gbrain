@@ -32,7 +32,7 @@ const SPACE_KEY = 'OCP';
 
 const OCP_PROJECTS = [
   'NEXT', 'MOCO', 'ING', 'AAX', 'DEVECO', 'MNE',
-  'AUTH', 'INTGR', 'CSOT', 'GBFM', 'FEP', 'PD', 'FEAST',
+  'AUTH', 'INTGR', 'GBFM', 'FEP', 'PD', 'FEAST',
 ];
 
 const DATA_DIR = join(import.meta.dir, '..', 'data');
