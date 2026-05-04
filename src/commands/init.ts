@@ -6,7 +6,7 @@ import { homedir } from 'os';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
-import { saveConfig, loadConfig, toEngineConfig, type GBrainConfig } from '../core/config.ts';
+import { saveConfig, loadConfig, toEngineConfig, gbrainPath, type GBrainConfig } from '../core/config.ts';
 import { createEngine } from '../core/engine-factory.ts';
 
 export async function runInit(args: string[]) {
@@ -103,7 +103,7 @@ async function initMigrateOnly(opts: { jsonOutput: boolean }) {
 }
 
 async function initPGLite(opts: { jsonOutput: boolean; apiKey: string | null; customPath: string | null }) {
-  const dbPath = opts.customPath || join(homedir(), '.gbrain', 'brain.pglite');
+  const dbPath = opts.customPath || gbrainPath('brain.pglite');
   console.log(`Setting up local brain with PGLite (no server needed)...`);
 
   const engine = await createEngine({ engine: 'pglite' });
@@ -137,6 +137,9 @@ async function initPGLite(opts: { jsonOutput: boolean; apiKey: string | null; cu
       console.log('');
       console.log('When you outgrow local: gbrain migrate --to supabase');
       reportModStatus();
+      const { printAdvisoryIfRecommended } = await import('../core/skillpack/post-install-advisory.ts');
+      const { VERSION } = await import('../version.ts');
+      printAdvisoryIfRecommended({ version: VERSION, context: 'init' });
     }
   } finally {
     try { await engine.disconnect(); } catch { /* best-effort */ }
@@ -218,6 +221,9 @@ async function initPostgres(opts: { databaseUrl: string; jsonOutput: boolean; ap
         console.log('Next: gbrain import <dir>');
       }
       reportModStatus();
+      const { printAdvisoryIfRecommended } = await import('../core/skillpack/post-install-advisory.ts');
+      const { VERSION } = await import('../version.ts');
+      printAdvisoryIfRecommended({ version: VERSION, context: 'init' });
     }
   } finally {
     try { await engine.disconnect(); } catch { /* best-effort */ }

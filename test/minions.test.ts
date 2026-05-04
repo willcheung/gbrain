@@ -1896,3 +1896,789 @@ describe('MinionQueue: v0.19.1 wall-clock + handleTimeouts non-interference (T1)
     expect(after?.status).toBe('active');
   });
 });
+
+// --- v0.22.2: RSS watchdog (--max-rss + periodic timer + gracefulShutdown) ---
+
+describe('MinionWorker: --max-rss watchdog', () => {
+  // Helper: build a worker with deterministic RSS injection. Tests pass a
+  // sequence of bytes; getRss() returns elements in order, repeating the last.
+  function makeRssSequence(values: number[]): () => number {
+    let i = 0;
+    return () => {
+      const v = values[Math.min(i, values.length - 1)];
+      i++;
+      return v;
+    };
+  }
+
+  test('per-job check: handler bumps RSS, post-job check trips, sibling aborts', async () => {
+    // 100MB threshold. RSS reads always return 250MB → first post-job check
+    // (after the 'quick' handler completes) trips and the 'slow' sibling
+    // sees its abort signal flip.
+    const worker = new MinionWorker(engine, {
+      queue: 'default',
+      concurrency: 2,
+      maxRssMb: 100,
+      getRss: () => 250 * 1024 * 1024,
+      pollInterval: 50,
+      stalledInterval: 10_000,
+      rssCheckInterval: 60_000, // disable periodic — exercise per-job only
+    });
+
+    let sibling2Aborted = false;
+    let sibling2Resolved = false;
+    let sibling1Done = false;
+
+    worker.register('quick', async () => {
+      // Resolves immediately. Triggers post-job check.
+      sibling1Done = true;
+    });
+    worker.register('slow', async (job) => {
+      // Long-running sibling. Watch for abort signal.
+      job.signal.addEventListener('abort', () => { sibling2Aborted = true; });
+      await new Promise<void>((resolve) => {
+        const t = setInterval(() => {
+          if (job.signal.aborted) { clearInterval(t); sibling2Resolved = true; resolve(); }
+        }, 20);
+      });
+    });
+
+    await queue.add('slow', {});
+    await queue.add('quick', {});
+
+    await worker.start(); // returns when stop() flips and drain completes
+
+    expect(sibling1Done).toBe(true);
+    expect(sibling2Aborted).toBe(true);
+    expect(sibling2Resolved).toBe(true);
+  }, 60_000);
+
+  test('periodic timer: zero job completions, watchdog still fires', async () => {
+    // Threshold 100MB. RSS = 250MB on every call. No job ever completes.
+    const worker = new MinionWorker(engine, {
+      queue: 'default',
+      concurrency: 1,
+      maxRssMb: 100,
+      getRss: () => 250 * 1024 * 1024,
+      pollInterval: 50,
+      stalledInterval: 10_000,
+      rssCheckInterval: 100, // fire fast in tests
+    });
+
+    let abortedDuringHandler = false;
+
+    worker.register('forever', async (job) => {
+      // Never returns naturally. Wait on abort.
+      await new Promise<void>((resolve) => {
+        const t = setInterval(() => {
+          if (job.signal.aborted) {
+            abortedDuringHandler = true;
+            clearInterval(t);
+            resolve();
+          }
+        }, 20);
+      });
+    });
+
+    await queue.add('forever', {});
+
+    await worker.start();
+
+    expect(abortedDuringHandler).toBe(true);
+  }, 60_000);
+
+  test('shutdownAbort fires (closes shell-handler zombie gap)', async () => {
+    const worker = new MinionWorker(engine, {
+      queue: 'default',
+      concurrency: 1,
+      maxRssMb: 100,
+      getRss: () => 250 * 1024 * 1024,
+      pollInterval: 50,
+      stalledInterval: 10_000,
+      rssCheckInterval: 100,
+    });
+
+    let shutdownSignalFired = false;
+
+    worker.register('observer', async (job) => {
+      // Subscribes to shutdownSignal — same pattern as shell.ts
+      job.shutdownSignal.addEventListener('abort', () => { shutdownSignalFired = true; });
+      await new Promise<void>((resolve) => {
+        const t = setInterval(() => {
+          if (job.signal.aborted) { clearInterval(t); resolve(); }
+        }, 20);
+      });
+    });
+
+    await queue.add('observer', {});
+    await worker.start();
+
+    expect(shutdownSignalFired).toBe(true);
+  }, 60_000);
+
+  test('below threshold: no-op (no shutdown)', async () => {
+    let postJobCount = 0;
+    const worker = new MinionWorker(engine, {
+      queue: 'default',
+      concurrency: 1,
+      maxRssMb: 1024,
+      getRss: () => { postJobCount++; return 50 * 1024 * 1024; }, // always 50MB, way under
+      pollInterval: 50,
+      stalledInterval: 10_000,
+      rssCheckInterval: 60_000,
+    });
+
+    worker.register('noop', async () => {});
+
+    await queue.add('noop', {});
+    await queue.add('noop', {});
+    await queue.add('noop', {});
+
+    // Run for a moment, then stop manually
+    const startPromise = worker.start();
+    await new Promise(r => setTimeout(r, 500));
+    worker.stop();
+    await startPromise;
+
+    // Watchdog never tripped → all 3 jobs completed
+    const completed = await queue.getJobs({ status: 'completed' });
+    expect(completed.length).toBe(3);
+    expect(postJobCount).toBeGreaterThanOrEqual(3); // checkMemoryLimit ran each time
+  }, 60_000);
+
+  test('maxRssMb=0 disables watchdog entirely', async () => {
+    const worker = new MinionWorker(engine, {
+      queue: 'default',
+      concurrency: 1,
+      maxRssMb: 0,
+      getRss: () => 999_999 * 1024 * 1024, // huge, but disabled
+      pollInterval: 50,
+      stalledInterval: 10_000,
+      rssCheckInterval: 100,
+    });
+
+    worker.register('noop', async () => {});
+    await queue.add('noop', {});
+
+    const startPromise = worker.start();
+    await new Promise(r => setTimeout(r, 500));
+    worker.stop();
+    await startPromise;
+
+    const completed = await queue.getJobs({ status: 'completed' });
+    expect(completed.length).toBe(1);
+  }, 60_000);
+});
+
+// --- v0.21: connectWithRetry + isRetryableDbConnectError ---
+
+describe('connectWithRetry / isRetryableDbConnectError', () => {
+  test('isRetryableDbConnectError matches transient patterns', async () => {
+    const { isRetryableDbConnectError } = await import('../src/core/db.ts');
+    expect(isRetryableDbConnectError(new Error('password authentication failed for user postgres'))).toBe(true);
+    expect(isRetryableDbConnectError(new Error('connection refused'))).toBe(true);
+    expect(isRetryableDbConnectError(new Error('the database system is starting up'))).toBe(true);
+    expect(isRetryableDbConnectError(new Error('Connection terminated unexpectedly'))).toBe(true);
+    expect(isRetryableDbConnectError(new Error('something happened: ECONNRESET'))).toBe(true);
+  });
+
+  test('isRetryableDbConnectError rejects permanent errors', async () => {
+    const { isRetryableDbConnectError } = await import('../src/core/db.ts');
+    expect(isRetryableDbConnectError(new Error('extension "vector" does not exist'))).toBe(false);
+    expect(isRetryableDbConnectError(new Error('relation "pages" does not exist'))).toBe(false);
+    expect(isRetryableDbConnectError(new Error('syntax error at end of input'))).toBe(false);
+  });
+
+  test('connectWithRetry: 1st rejects transient, 2nd succeeds', async () => {
+    const { connectWithRetry } = await import('../src/core/db.ts');
+    let attempts = 0;
+    const fakeEngine = {
+      connect: async () => {
+        attempts++;
+        if (attempts === 1) throw new Error('password authentication failed for user postgres');
+      },
+    } as unknown as Parameters<typeof connectWithRetry>[0];
+
+    await connectWithRetry(fakeEngine, { database_url: 'postgres://x' }, { baseDelayMs: 1, log: () => {} });
+    expect(attempts).toBe(2);
+  });
+
+  test('connectWithRetry: 3 transient rejects → throws', async () => {
+    const { connectWithRetry } = await import('../src/core/db.ts');
+    let attempts = 0;
+    const fakeEngine = {
+      connect: async () => {
+        attempts++;
+        throw new Error('connection refused');
+      },
+    } as unknown as Parameters<typeof connectWithRetry>[0];
+
+    await expect(
+      connectWithRetry(fakeEngine, { database_url: 'postgres://x' }, { baseDelayMs: 1, log: () => {} })
+    ).rejects.toThrow('connection refused');
+    expect(attempts).toBe(3);
+  });
+
+  test('connectWithRetry: permanent error does NOT retry', async () => {
+    const { connectWithRetry } = await import('../src/core/db.ts');
+    let attempts = 0;
+    const fakeEngine = {
+      connect: async () => {
+        attempts++;
+        throw new Error('extension "vector" does not exist');
+      },
+    } as unknown as Parameters<typeof connectWithRetry>[0];
+
+    await expect(
+      connectWithRetry(fakeEngine, { database_url: 'postgres://x' }, { baseDelayMs: 1, log: () => {} })
+    ).rejects.toThrow('extension "vector"');
+    expect(attempts).toBe(1);
+  });
+
+  test('connectWithRetry: noRetry honored', async () => {
+    const { connectWithRetry } = await import('../src/core/db.ts');
+    let attempts = 0;
+    const fakeEngine = {
+      connect: async () => {
+        attempts++;
+        throw new Error('connection refused');
+      },
+    } as unknown as Parameters<typeof connectWithRetry>[0];
+
+    await expect(
+      connectWithRetry(fakeEngine, { database_url: 'postgres://x' }, { noRetry: true, log: () => {} })
+    ).rejects.toThrow();
+    expect(attempts).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Abort signal propagation + force-eviction (v0.20.5 cycle-abort fix)
+// ---------------------------------------------------------------------------
+
+describe('MinionWorker: abort signal propagation (v0.20.5)', () => {
+  test('handler receiving abort signal can exit cleanly', async () => {
+    // Handler that respects AbortSignal
+    const job = await queue.add('abort-aware', {}, { timeout_ms: 150, max_attempts: 1 });
+    let signalAborted = false;
+
+    const worker = new MinionWorker(engine, { pollInterval: 50 });
+    worker.register('abort-aware', async (ctx) => {
+      // Simulate long work that checks signal
+      while (!ctx.signal.aborted) {
+        await new Promise(r => setTimeout(r, 10));
+      }
+      signalAborted = true;
+      throw ctx.signal.reason || new Error('aborted');
+    });
+
+    const workerPromise = worker.start();
+    // Wait for timeout (150ms) + handler to notice + margin
+    await new Promise(r => setTimeout(r, 500));
+    worker.stop();
+    await workerPromise;
+
+    expect(signalAborted).toBe(true);
+    const result = await queue.getJob(job.id);
+    // Should be dead (max_attempts: 1, aborted)
+    expect(result!.status).toBe('dead');
+    expect(result!.error_text).toContain('abort');
+  });
+
+  test('handler ignoring abort signal still gets abort fired', async () => {
+    // Handler that IGNORES AbortSignal — the exact bug pattern.
+    // We verify the abort fires (the signal flips) even though the handler
+    // doesn't check it. The 30s force-eviction grace is too long for unit
+    // tests; the E2E test in test/e2e/worker-abort-recovery.test.ts covers
+    // the full force-eviction path. Here we just verify the abort signal
+    // is delivered to the handler context.
+    const job = await queue.add('abort-ignorer', {}, { timeout_ms: 100, max_attempts: 1 });
+    let handlerStarted = false;
+    let signalWasAborted = false;
+
+    const worker = new MinionWorker(engine, { pollInterval: 50 });
+    worker.register('abort-ignorer', async (ctx) => {
+      handlerStarted = true;
+      // Wait a bit, then check if signal was aborted
+      await new Promise(r => setTimeout(r, 200));
+      signalWasAborted = ctx.signal.aborted;
+      // Now exit (a well-behaved handler would do this)
+      if (ctx.signal.aborted) {
+        throw ctx.signal.reason || new Error('aborted');
+      }
+      return { ok: true };
+    });
+
+    const workerPromise = worker.start();
+    await new Promise(r => setTimeout(r, 500));
+
+    expect(handlerStarted).toBe(true);
+    expect(signalWasAborted).toBe(true);
+
+    worker.stop();
+    await workerPromise;
+
+    const result = await queue.getJob(job.id);
+    expect(result!.status).toBe('dead');
+  });
+
+  test('worker claims new jobs after timeout eviction (no wedge)', async () => {
+    // The critical regression test: submit a slow job that times out,
+    // then submit a fast job. The fast job MUST execute.
+    const slowJob = await queue.add('slow-timeout', {}, { timeout_ms: 100, max_attempts: 1 });
+    let slowAborted = false;
+    let fastExecuted = false;
+
+    const worker = new MinionWorker(engine, { pollInterval: 50, concurrency: 1 });
+    worker.register('slow-timeout', async (ctx) => {
+      // Respects abort but takes a moment
+      await new Promise(r => setTimeout(r, 50));
+      while (!ctx.signal.aborted) {
+        await new Promise(r => setTimeout(r, 10));
+      }
+      slowAborted = true;
+      throw new Error('aborted: timeout');
+    });
+    worker.register('fast-after', async () => {
+      fastExecuted = true;
+      return { fast: true };
+    });
+
+    const workerPromise = worker.start();
+
+    // Wait for slow job to start and timeout
+    await new Promise(r => setTimeout(r, 300));
+
+    // Now submit the fast job — it should get claimed
+    const fastJob = await queue.add('fast-after', {});
+    await new Promise(r => setTimeout(r, 300));
+
+    worker.stop();
+    await workerPromise;
+
+    expect(slowAborted).toBe(true);
+    expect(fastExecuted).toBe(true);
+
+    const slowResult = await queue.getJob(slowJob.id);
+    expect(slowResult!.status).toBe('dead');
+
+    const fastResult = await queue.getJob(fastJob.id);
+    expect(fastResult!.status).toBe('completed');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// checkAborted (v0.20.5 cycle.ts)
+// ---------------------------------------------------------------------------
+
+describe('checkAborted (v0.20.5 cycle signal)', () => {
+  // Import the function indirectly by testing the behavior pattern
+  test('undefined signal does not throw', () => {
+    // checkAborted is not exported, so we test through CycleOpts behavior.
+    // This test validates the pattern directly. The `as` cast keeps the
+    // union type intact — a bare `const signal = undefined` (or even
+    // `const signal: AbortSignal | undefined = undefined`) would narrow
+    // back to literal `undefined` via TS control-flow analysis and then
+    // reject the optional-chain access on it.
+    const signal = undefined as AbortSignal | undefined;
+    expect(() => {
+      if (signal?.aborted) throw new Error('aborted');
+    }).not.toThrow();
+  });
+
+  test('non-aborted signal does not throw', () => {
+    const abort = new AbortController();
+    expect(() => {
+      if (abort.signal.aborted) throw new Error('aborted');
+    }).not.toThrow();
+  });
+
+  test('aborted signal throws with reason', () => {
+    const abort = new AbortController();
+    abort.abort(new Error('timeout'));
+    expect(() => {
+      if (abort.signal.aborted) {
+        const reason = abort.signal.reason instanceof Error
+          ? abort.signal.reason.message
+          : String(abort.signal.reason || 'aborted');
+        throw new Error(`[cycle] aborted between phases: ${reason}`);
+      }
+    }).toThrow('aborted between phases: timeout');
+  });
+});
+
+// --- v0.22.14: Self-health-check for bare workers ---
+
+describe('MinionWorker: self-health-check', () => {
+  test('health check is active when GBRAIN_SUPERVISED is not set', async () => {
+    // Save and clear the env var
+    const saved = process.env.GBRAIN_SUPERVISED;
+    delete process.env.GBRAIN_SUPERVISED;
+
+    try {
+      const worker = new MinionWorker(engine, {
+        queue: 'default',
+        concurrency: 1,
+        healthCheckInterval: 100, // fast for testing
+        pollInterval: 50,
+        stalledInterval: 10_000,
+        maxRssMb: 0,
+      });
+
+      worker.register('noop', async () => {});
+      await queue.add('noop', {});
+
+      const startPromise = worker.start();
+      // Let the health check fire at least once (100ms interval)
+      await new Promise(r => setTimeout(r, 300));
+      worker.stop();
+      await startPromise;
+
+      // Worker should have processed the job despite health check running
+      const completed = await queue.getJobs({ status: 'completed' });
+      expect(completed.length).toBeGreaterThanOrEqual(1);
+    } finally {
+      if (saved !== undefined) process.env.GBRAIN_SUPERVISED = saved;
+      else delete process.env.GBRAIN_SUPERVISED;
+    }
+  }, 10_000);
+
+  test('health check is skipped when GBRAIN_SUPERVISED=1', async () => {
+    const saved = process.env.GBRAIN_SUPERVISED;
+    process.env.GBRAIN_SUPERVISED = '1';
+
+    try {
+      const worker = new MinionWorker(engine, {
+        queue: 'default',
+        concurrency: 1,
+        healthCheckInterval: 100,
+        pollInterval: 50,
+        stalledInterval: 10_000,
+        maxRssMb: 0,
+      });
+
+      worker.register('noop', async () => {});
+      await queue.add('noop', {});
+
+      const startPromise = worker.start();
+      await new Promise(r => setTimeout(r, 300));
+      worker.stop();
+      await startPromise;
+
+      // Worker should still process jobs fine
+      const completed = await queue.getJobs({ status: 'completed' });
+      expect(completed.length).toBeGreaterThanOrEqual(1);
+    } finally {
+      if (saved !== undefined) process.env.GBRAIN_SUPERVISED = saved;
+      else delete process.env.GBRAIN_SUPERVISED;
+    }
+  }, 10_000);
+
+  test('healthCheckInterval=0 disables health check', async () => {
+    delete process.env.GBRAIN_SUPERVISED;
+
+    const worker = new MinionWorker(engine, {
+      queue: 'default',
+      concurrency: 1,
+      healthCheckInterval: 0,
+      pollInterval: 50,
+      stalledInterval: 10_000,
+      maxRssMb: 0,
+    });
+
+    worker.register('noop', async () => {});
+    await queue.add('noop', {});
+
+    const startPromise = worker.start();
+    await new Promise(r => setTimeout(r, 300));
+    worker.stop();
+    await startPromise;
+
+    const completed = await queue.getJobs({ status: 'completed' });
+    expect(completed.length).toBeGreaterThanOrEqual(1);
+  }, 10_000);
+});
+
+// --- v0.22.14: Self-health-check behavior tests (D7) ---
+// These tests use a Proxy around the real engine so executeRaw can be
+// intercepted by SQL pattern. SELECT 1 = liveness probe; the count(*) query
+// = stall detection. Anything else passes through to the underlying engine.
+
+interface ProbeOverrides {
+  /** When set, executeRaw('SELECT 1') uses this function instead of pass-through.
+   *  Returning a thrown error simulates DB death; returning [{}] simulates success. */
+  selectOne?: () => Promise<unknown>;
+  /** When set, executeRaw of the stall-detection count(*) query returns this. */
+  countWaiting?: (handlers: string[]) => number;
+  /** Captures the last SQL string that matched the stall-count regex. Tests
+   *  use this to assert the production SQL still contains `name = ANY(...)`
+   *  so a future refactor that drops the predicate is caught. */
+  capturedStallSql?: { sql: string | null };
+}
+
+function makeProbeEngine(overrides: ProbeOverrides) {
+  return new Proxy(engine, {
+    get(target, prop, receiver) {
+      if (prop === 'executeRaw') {
+        return async (sql: string, params?: unknown[]): Promise<unknown[]> => {
+          if (overrides.selectOne && /^\s*SELECT\s+1\s*$/i.test(sql)) {
+            const r = await overrides.selectOne();
+            return Array.isArray(r) ? r : [r];
+          }
+          if (overrides.countWaiting && /count\(\*\).*minion_jobs.*WHERE\s+status\s*=\s*'waiting'/is.test(sql)) {
+            if (overrides.capturedStallSql) overrides.capturedStallSql.sql = sql;
+            const handlers = (params?.[1] as string[]) ?? [];
+            return [{ cnt: String(overrides.countWaiting(handlers)) }];
+          }
+          // Pass through to real engine for anything else (claim queries etc.)
+          return (target as unknown as { executeRaw: (s: string, p?: unknown[]) => Promise<unknown[]> })
+            .executeRaw(sql, params);
+        };
+      }
+      return Reflect.get(target, prop, receiver);
+    },
+  }) as unknown as PGLiteEngine;
+}
+
+describe('MinionWorker: self-health-check behavior (v0.22.14)', () => {
+  test('emits unhealthy{db_dead} after dbFailExitAfter consecutive DB probe failures', async () => {
+    delete process.env.GBRAIN_SUPERVISED;
+
+    let probeCount = 0;
+    const probeEngine = makeProbeEngine({
+      selectOne: async () => {
+        probeCount++;
+        throw new Error('connection terminated unexpectedly');
+      },
+    });
+
+    const worker = new MinionWorker(probeEngine, {
+      queue: 'default',
+      concurrency: 1,
+      healthCheckInterval: 30,
+      dbFailExitAfter: 3,
+      pollInterval: 50,
+      stalledInterval: 10_000,
+      maxRssMb: 0,
+    });
+
+    worker.register('noop', async () => {});
+
+    const events: Array<{ reason: string }> = [];
+    worker.on('unhealthy', (info) => { events.push(info); });
+
+    const startPromise = worker.start();
+    // 3 ticks at 30ms = 90ms; give extra slack.
+    await new Promise(r => setTimeout(r, 250));
+    worker.stop();
+    await startPromise;
+
+    expect(probeCount).toBeGreaterThanOrEqual(3);
+    expect(events.length).toBeGreaterThanOrEqual(1);
+    expect(events[0].reason).toBe('db_dead');
+  }, 10_000);
+
+  test('DB recovery resets the failure counter (no exit after intermittent failures)', async () => {
+    delete process.env.GBRAIN_SUPERVISED;
+
+    let probeCount = 0;
+    // Pattern: fail, fail, succeed (resets), fail, fail, then permanently succeed.
+    // No 3 consecutive failures, so dbFailExitAfter=3 must NOT trip.
+    const probeEngine = makeProbeEngine({
+      selectOne: async () => {
+        const idx = probeCount++;
+        if (idx === 0 || idx === 1 || idx === 3 || idx === 4) {
+          throw new Error('transient blip');
+        }
+        return [{ ok: 1 }];
+      },
+    });
+
+    const worker = new MinionWorker(probeEngine, {
+      queue: 'default',
+      concurrency: 1,
+      healthCheckInterval: 30,
+      dbFailExitAfter: 3,
+      pollInterval: 50,
+      stalledInterval: 10_000,
+      maxRssMb: 0,
+    });
+
+    worker.register('noop', async () => {});
+
+    const events: Array<{ reason: string }> = [];
+    worker.on('unhealthy', (info) => { events.push(info); });
+
+    const startPromise = worker.start();
+    await new Promise(r => setTimeout(r, 250));
+    worker.stop();
+    await startPromise;
+
+    // Counter should never have hit 3 consecutive — success at index 2 resets it.
+    const dbDeadEvents = events.filter(e => e.reason === 'db_dead');
+    expect(dbDeadEvents.length).toBe(0);
+  }, 10_000);
+
+  test('emits unhealthy{stalled} after stallExitAfterMs of continuous idle with waiting jobs', async () => {
+    delete process.env.GBRAIN_SUPERVISED;
+
+    const probeEngine = makeProbeEngine({
+      selectOne: async () => [{ ok: 1 }],
+      countWaiting: () => 5, // pretend 5 jobs are waiting for our handler names
+    });
+
+    const worker = new MinionWorker(probeEngine, {
+      queue: 'default',
+      concurrency: 1,
+      healthCheckInterval: 30,
+      stallWarnAfterMs: 50,
+      stallExitAfterMs: 100,
+      pollInterval: 50,
+      stalledInterval: 10_000,
+      maxRssMb: 0,
+    });
+
+    worker.register('noop', async () => {});
+    // Don't queue any real jobs — claim returns null, inFlight stays 0,
+    // jobsCompleted stays 0, idle clock advances.
+
+    const events: Array<{ reason: string; waitingCount?: number }> = [];
+    worker.on('unhealthy', (info) => { events.push(info); });
+
+    const startPromise = worker.start();
+    // Both thresholds measured from lastCompletionTime (corrected per codex r2):
+    //   - tick @ +30ms: idle=30ms, < stallWarnAfterMs(50), no warn
+    //   - tick @ +60ms: idle=60ms, > 50, warn fires (stallWarningSince set)
+    //   - tick @ +90ms: idle=90ms, < stallExitAfterMs(100), no exit yet
+    //   - tick @ +120ms: idle=120ms, > 100 → exit fires (unhealthy event)
+    // Wait 350ms which leaves comfortable slack for setTimeout drift.
+    await new Promise(r => setTimeout(r, 350));
+    worker.stop();
+    await startPromise;
+
+    const stalledEvents = events.filter(e => e.reason === 'stalled');
+    expect(stalledEvents.length).toBeGreaterThanOrEqual(1);
+    expect(stalledEvents[0].waitingCount).toBe(5);
+    // The idleMinutes payload should reflect total idle, not warn-since.
+    // With idle ~120ms at exit time, idleMinutes rounds to 0 — that's
+    // expected; the value is informative, not load-bearing.
+  }, 10_000);
+
+  test('inFlight > 0 blocks stall detection (long-running legitimate job)', async () => {
+    delete process.env.GBRAIN_SUPERVISED;
+
+    const probeEngine = makeProbeEngine({
+      selectOne: async () => [{ ok: 1 }],
+      countWaiting: () => 5,
+    });
+
+    const worker = new MinionWorker(probeEngine, {
+      queue: 'default',
+      concurrency: 1,
+      healthCheckInterval: 30,
+      stallWarnAfterMs: 50,
+      stallExitAfterMs: 100,
+      pollInterval: 50,
+      stalledInterval: 10_000,
+      maxRssMb: 0,
+    });
+
+    worker.register('noop', async () => {});
+
+    const events: Array<{ reason: string }> = [];
+    worker.on('unhealthy', (info) => { events.push(info); });
+
+    // Inject a fake in-flight entry directly. This bypasses the claim path
+    // (which goes through the proxy and complicates the cleanup race) and
+    // tests exactly what we want: the stall check's `inFlight.size === 0`
+    // gate when there's legitimate ongoing work.
+    const fakeInFlight = (worker as unknown as {
+      inFlight: Map<number, { lockTimer: NodeJS.Timeout; abort: AbortController; promise: Promise<void> }>
+    }).inFlight;
+    const fakeAbort = new AbortController();
+    const fakePromise = new Promise<void>(() => { /* never resolves */ });
+    const fakeTimer = setInterval(() => {}, 60_000); // dummy lock timer
+    fakeInFlight.set(99999, { lockTimer: fakeTimer, abort: fakeAbort, promise: fakePromise });
+
+    const startPromise = worker.start();
+    await new Promise(r => setTimeout(r, 350));
+    // Remove our fake entry before stop so the worker doesn't wait 30s for it.
+    clearInterval(fakeTimer);
+    fakeInFlight.delete(99999);
+    worker.stop();
+    await startPromise;
+
+    // No stall event should fire — inFlight.size > 0 gates the stall check.
+    const stalledEvents = events.filter(e => e.reason === 'stalled');
+    expect(stalledEvents.length).toBe(0);
+  }, 10_000);
+
+  test('regression (D1): waiting jobs of unregistered handler names do NOT trigger stall exit', async () => {
+    delete process.env.GBRAIN_SUPERVISED;
+
+    // The count(*) query is filtered by registered handler names. If handlers=['noop']
+    // and the queue has 5 'widget-fn' jobs, the SQL `name = ANY($2)` filter returns 0.
+    // The probe engine simulates this by checking handlers before returning a count;
+    // we ALSO capture the SQL to assert the predicate text is actually present (so a
+    // future refactor that silently drops `AND name = ANY(...)` is caught).
+    const capturedStallSql = { sql: null as string | null };
+    const probeEngine = makeProbeEngine({
+      selectOne: async () => [{ ok: 1 }],
+      countWaiting: (handlers) => handlers.includes('widget-fn') ? 5 : 0,
+      capturedStallSql,
+    });
+
+    const worker = new MinionWorker(probeEngine, {
+      queue: 'default',
+      concurrency: 1,
+      healthCheckInterval: 50,
+      stallWarnAfterMs: 100,
+      stallExitAfterMs: 200,
+      pollInterval: 50,
+      stalledInterval: 10_000,
+      maxRssMb: 0,
+    });
+
+    // Register 'noop' but pretend the queue is full of 'widget-fn' (unhandled).
+    worker.register('noop', async () => {});
+
+    const events: Array<{ reason: string }> = [];
+    worker.on('unhealthy', (info) => { events.push(info); });
+
+    const startPromise = worker.start();
+    // Window > stallExitAfterMs; if D1 fix wasn't applied, stall would fire.
+    await new Promise(r => setTimeout(r, 500));
+    worker.stop();
+    await startPromise;
+
+    // No stall event — the count for 'noop' handlers is 0, so worker is correctly idle.
+    const stalledEvents = events.filter(e => e.reason === 'stalled');
+    expect(stalledEvents.length).toBe(0);
+    // SQL shape assertion: the production query MUST filter by handler names.
+    // Without this assertion, a future change that drops the predicate would
+    // pass the no-event check above (the handler array would be irrelevant
+    // to the underlying DB but our probe just needs to return 0).
+    expect(capturedStallSql.sql).not.toBeNull();
+    expect(capturedStallSql.sql).toMatch(/name\s*=\s*ANY/i);
+  }, 10_000);
+
+  test('regression (R3): constructor throws when stallExitAfterMs <= stallWarnAfterMs', () => {
+    // The contract on MinionWorkerOpts.stallExitAfterMs says "Must be >
+    // stallWarnAfterMs". Without validation, an exit threshold equal to or
+    // less than the warn threshold made the configured exit time a lie
+    // (warn fires first, exit can't preempt). The constructor now throws
+    // loudly so misconfigurations fail at startup, not at idle-time.
+    expect(() => new MinionWorker(engine, {
+      stallWarnAfterMs: 200,
+      stallExitAfterMs: 100, // less than warn — invalid
+    })).toThrow(/stallExitAfterMs.*must be > stallWarnAfterMs/i);
+
+    expect(() => new MinionWorker(engine, {
+      stallWarnAfterMs: 100,
+      stallExitAfterMs: 100, // equal to warn — also invalid (must be strictly >)
+    })).toThrow(/stallExitAfterMs.*must be > stallWarnAfterMs/i);
+
+    // Sanity: defaults (5min warn / 10min exit) construct without throwing.
+    expect(() => new MinionWorker(engine, {})).not.toThrow();
+  });
+});

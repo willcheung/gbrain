@@ -1,6 +1,9 @@
 [test]
-# PGLite initialization can be slow under parallel test execution.
-# Default 5s is too short when many test files boot PGLite instances at once.
-# 60s is the empirical ceiling we observed before the first file's beforeAll
-# completed on a loaded machine.
+# PGLite WASM cold start + initSchema() runs ~5–20s on loaded machines.
+# Default 5s is too short for those tests' beforeAll hooks. 60s is the
+# empirical ceiling we observed for the slowest cold-init paths.
+#
+# v0.26.4: scripts/run-unit-parallel.sh and scripts/run-unit-shard.sh
+# also pass `--timeout=60000` explicitly so the ceiling is consistent
+# whether tests are invoked through the wrapper or directly via bun test.
 timeout = 60_000

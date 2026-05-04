@@ -811,6 +811,588 @@ export const MIGRATIONS: Migration[] = [
         RAISE NOTICE 'v24: RLS backfill complete (role % has BYPASSRLS)', current_user;
       END $$;
     `,
+    // PGLite has no RLS engine and is intrinsically single-tenant (local file).
+    // The 8 ALTER TABLE ... ENABLE ROW LEVEL SECURITY statements above also
+    // target tables that may not exist on PGLite (subagent_*, minion_inbox),
+    // since pglite-schema.ts is the canonical PGLite schema source. No-op
+    // override keeps PGLite upgrades unwedged and the version bump intact.
+    sqlFor: {
+      pglite: '',
+    },
+  },
+  {
+    version: 25,
+    name: 'pages_page_kind',
+    // v0.19.0 Layer 3 — pages.page_kind distinguishes markdown vs code pages
+    // at the DB level. Needed so orphans filter, link-extraction auto-link,
+    // and query --lang can branch on kind without sniffing `type` or chunk
+    // metadata. Existing rows backfill to 'markdown' (pre-v0.19.0 all pages
+    // were markdown).
+    //
+    // Postgres: ADD COLUMN with DEFAULT is O(1) for nullable columns (no
+    // rewrite). The CHECK constraint is added NOT VALID so the initial
+    // statement does not scan the table, then VALIDATE CONSTRAINT runs
+    // separately. Tables with millions of pages would otherwise hold a
+    // write lock during the full scan.
+    sqlFor: {
+      postgres: `
+        ALTER TABLE pages
+          ADD COLUMN IF NOT EXISTS page_kind TEXT NOT NULL DEFAULT 'markdown';
+
+        ALTER TABLE pages
+          DROP CONSTRAINT IF EXISTS pages_page_kind_check;
+        ALTER TABLE pages
+          ADD CONSTRAINT pages_page_kind_check
+          CHECK (page_kind IN ('markdown','code')) NOT VALID;
+        ALTER TABLE pages VALIDATE CONSTRAINT pages_page_kind_check;
+      `,
+      pglite: `
+        ALTER TABLE pages
+          ADD COLUMN IF NOT EXISTS page_kind TEXT NOT NULL DEFAULT 'markdown'
+          CHECK (page_kind IN ('markdown','code'));
+      `,
+    },
+    sql: `
+      ALTER TABLE pages
+        ADD COLUMN IF NOT EXISTS page_kind TEXT NOT NULL DEFAULT 'markdown'
+        CHECK (page_kind IN ('markdown','code'));
+    `,
+  },
+  {
+    version: 26,
+    name: 'content_chunks_code_metadata',
+    // v0.19.0 Layer 3 — content_chunks gains code-specific metadata columns
+    // so C6 (query --lang), C7 (code-def / code-refs), and the new
+    // searchCodeChunks engine method can filter + surface symbol context
+    // without parsing chunk_text.
+    //
+    // All new columns are nullable — existing markdown chunks carry NULL.
+    // importCodeFile populates them from the tree-sitter AST.
+    //
+    // Partial indexes (WHERE <col> IS NOT NULL) keep the index small: a
+    // brain with 20K markdown chunks + 20K code chunks indexes only the
+    // code chunks for symbol lookups. Measured ~200ms → ~15ms on code-refs.
+    sql: `
+      ALTER TABLE content_chunks
+        ADD COLUMN IF NOT EXISTS language TEXT,
+        ADD COLUMN IF NOT EXISTS symbol_name TEXT,
+        ADD COLUMN IF NOT EXISTS symbol_type TEXT,
+        ADD COLUMN IF NOT EXISTS start_line INTEGER,
+        ADD COLUMN IF NOT EXISTS end_line INTEGER;
+
+      CREATE INDEX IF NOT EXISTS idx_chunks_symbol_name
+        ON content_chunks(symbol_name) WHERE symbol_name IS NOT NULL;
+      CREATE INDEX IF NOT EXISTS idx_chunks_language
+        ON content_chunks(language) WHERE language IS NOT NULL;
+    `,
+  },
+  {
+    version: 27,
+    name: 'cathedral_ii_foundation',
+    // v0.20.0 Cathedral II Layer 1 — schema-only foundation.
+    //
+    // Lands BEFORE any consumer layer to eliminate forward references
+    // (codex SP-4). All Cathedral II DDL arrives here as one atomic
+    // transaction:
+    //
+    //   1. content_chunks gains 4 columns:
+    //      - parent_symbol_path TEXT[]   — scope chain for nested symbols (A3)
+    //      - doc_comment TEXT            — extracted JSDoc/docstring (A4)
+    //      - symbol_name_qualified TEXT  — 'Admin::UsersController#render' (A1)
+    //      - search_vector TSVECTOR      — chunk-grain FTS (Layer 1b)
+    //
+    //   2. sources.chunker_version TEXT — SP-1 gate. performSync forces
+    //      full walk on mismatch with CURRENT_CHUNKER_VERSION, bypassing
+    //      the up_to_date git-HEAD early-return that made the bare
+    //      CHUNKER_VERSION bump a silent no-op.
+    //
+    //   3. code_edges_chunk — resolved call-graph / type-ref edges.
+    //      FK CASCADE from content_chunks on both endpoints; deleting a
+    //      chunk wipes its edges. UNIQUE (from, to, edge_type) holds
+    //      idempotency. source_id TEXT matches sources.id actual type
+    //      (codex F4). Source scoping is enforced in resolution logic,
+    //      not in the key, because from_chunk_id → pages.source_id
+    //      already determines it.
+    //
+    //   4. code_edges_symbol — unresolved refs. Target symbol is known
+    //      by qualified name but the defining chunk hasn't been imported
+    //      yet. Rows UNION with code_edges_chunk on read (codex 1.3b);
+    //      no promotion step.
+    //
+    //   5. update_chunk_search_vector trigger — BEFORE INSERT/UPDATE
+    //      OF (chunk_text, doc_comment, symbol_name_qualified). Builds
+    //      search_vector with weight A on doc_comment + symbol_name_qualified,
+    //      B on chunk_text. Natural-language queries rank doc-comment hits
+    //      above body-text hits (A4 intent).
+    //
+    // Consumer layers (Layer 5 A1, Layer 6 A3, Layer 10 C CLI, Layer 12
+    // CHUNKER_VERSION bump, Layer 13 E2 reindex-code) all depend on this
+    // foundation. Absent it, every downstream layer would have forward
+    // refs.
+    sql: `
+      -- content_chunks: new Cathedral II columns
+      ALTER TABLE content_chunks
+        ADD COLUMN IF NOT EXISTS parent_symbol_path TEXT[],
+        ADD COLUMN IF NOT EXISTS doc_comment TEXT,
+        ADD COLUMN IF NOT EXISTS symbol_name_qualified TEXT,
+        ADD COLUMN IF NOT EXISTS search_vector TSVECTOR;
+
+      CREATE INDEX IF NOT EXISTS idx_chunks_search_vector
+        ON content_chunks USING GIN(search_vector);
+      CREATE INDEX IF NOT EXISTS idx_chunks_symbol_qualified
+        ON content_chunks(symbol_name_qualified) WHERE symbol_name_qualified IS NOT NULL;
+
+      -- sources: SP-1 chunker_version gate
+      ALTER TABLE sources
+        ADD COLUMN IF NOT EXISTS chunker_version TEXT;
+
+      -- code_edges_chunk: resolved edges
+      CREATE TABLE IF NOT EXISTS code_edges_chunk (
+        id                    SERIAL PRIMARY KEY,
+        from_chunk_id         INTEGER NOT NULL REFERENCES content_chunks(id) ON DELETE CASCADE,
+        to_chunk_id           INTEGER NOT NULL REFERENCES content_chunks(id) ON DELETE CASCADE,
+        from_symbol_qualified TEXT NOT NULL,
+        to_symbol_qualified   TEXT NOT NULL,
+        edge_type             TEXT NOT NULL,
+        edge_metadata         JSONB NOT NULL DEFAULT '{}',
+        source_id             TEXT REFERENCES sources(id) ON DELETE CASCADE,
+        created_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+        CONSTRAINT code_edges_chunk_unique UNIQUE (from_chunk_id, to_chunk_id, edge_type)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_code_edges_chunk_from
+        ON code_edges_chunk(from_chunk_id, edge_type);
+      CREATE INDEX IF NOT EXISTS idx_code_edges_chunk_to
+        ON code_edges_chunk(to_chunk_id, edge_type);
+      CREATE INDEX IF NOT EXISTS idx_code_edges_chunk_to_symbol
+        ON code_edges_chunk(to_symbol_qualified, edge_type);
+
+      -- code_edges_symbol: unresolved refs
+      CREATE TABLE IF NOT EXISTS code_edges_symbol (
+        id                    SERIAL PRIMARY KEY,
+        from_chunk_id         INTEGER NOT NULL REFERENCES content_chunks(id) ON DELETE CASCADE,
+        from_symbol_qualified TEXT NOT NULL,
+        to_symbol_qualified   TEXT NOT NULL,
+        edge_type             TEXT NOT NULL,
+        edge_metadata         JSONB NOT NULL DEFAULT '{}',
+        source_id             TEXT REFERENCES sources(id) ON DELETE CASCADE,
+        created_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+        CONSTRAINT code_edges_symbol_unique UNIQUE (from_chunk_id, to_symbol_qualified, edge_type)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_code_edges_symbol_from
+        ON code_edges_symbol(from_chunk_id, edge_type);
+      CREATE INDEX IF NOT EXISTS idx_code_edges_symbol_to
+        ON code_edges_symbol(to_symbol_qualified, edge_type);
+
+      -- Chunk-grain FTS trigger (Layer 1b consumer — column exists from this
+      -- migration, trigger installed now so newly-written chunks get vectors
+      -- from day one). NULL-safe: markdown chunks leave doc_comment and
+      -- symbol_name_qualified NULL; COALESCE('') keeps the vector build
+      -- from failing on missing weights.
+      CREATE OR REPLACE FUNCTION update_chunk_search_vector() RETURNS TRIGGER AS $fn$
+      BEGIN
+        NEW.search_vector :=
+          setweight(to_tsvector('english', COALESCE(NEW.doc_comment, '')), 'A') ||
+          setweight(to_tsvector('english', COALESCE(NEW.symbol_name_qualified, '')), 'A') ||
+          setweight(to_tsvector('english', COALESCE(NEW.chunk_text, '')), 'B');
+        RETURN NEW;
+      END;
+      $fn$ LANGUAGE plpgsql;
+
+      DROP TRIGGER IF EXISTS chunk_search_vector_trigger ON content_chunks;
+      CREATE TRIGGER chunk_search_vector_trigger
+        BEFORE INSERT OR UPDATE OF chunk_text, doc_comment, symbol_name_qualified
+        ON content_chunks
+        FOR EACH ROW EXECUTE FUNCTION update_chunk_search_vector();
+    `,
+  },
+  {
+    version: 28,
+    name: 'cathedral_ii_chunk_fts_backfill',
+    // v0.20.0 Cathedral II Layer 3 (1b) — backfill content_chunks.search_vector
+    // for rows inserted before v27 ran. The v27 trigger only fires on
+    // INSERT/UPDATE, so every chunk that existed before upgrade has a NULL
+    // search_vector and would match zero rows in the new chunk-grain
+    // searchKeyword. Compute the vector in-place here so upgraded brains
+    // have full keyword coverage the moment v28 commits — no need to wait
+    // for every page to get touched by sync.
+    //
+    // Direct vector compute (not UPDATE chunk_text = chunk_text to trigger):
+    //   - UPDATE-to-same-value fires the trigger unconditionally on Postgres
+    //     even if no column value changes, so trigger-based backfill DOES
+    //     work, but writing the vector directly is cheaper (single pass
+    //     instead of trigger overhead per row).
+    //   - Idempotent via `WHERE search_vector IS NULL` — re-running v28
+    //     after a partial run picks up only the remaining NULL rows.
+    //
+    // On a 20K-chunk brain: ~2-3s total. No blocking concerns: chunks are
+    // append-only in steady state; the UPDATE takes a row lock per chunk
+    // briefly while computing the tsvector.
+    sql: `
+      UPDATE content_chunks
+      SET search_vector =
+        setweight(to_tsvector('english', COALESCE(doc_comment, '')), 'A') ||
+        setweight(to_tsvector('english', COALESCE(symbol_name_qualified, '')), 'A') ||
+        setweight(to_tsvector('english', COALESCE(chunk_text, '')), 'B')
+      WHERE search_vector IS NULL;
+    `,
+  },
+  {
+    version: 29,
+    name: 'cathedral_ii_code_edges_rls',
+    // v0.21.0 Cathedral II — RLS hardening for the two new tables added by
+    // v27 (code_edges_chunk, code_edges_symbol). The v24 RLS-backfill
+    // pattern: gated on BYPASSRLS (so we don't lock the migrating session
+    // out of its own data on a non-bypass role) + bare ALTER TABLE since
+    // both tables are guaranteed to exist after v27.
+    //
+    // Postgres-only via sqlFor: PGLite doesn't enforce RLS the same way
+    // and v24 already runs only against Postgres in practice. The E2E
+    // test "RLS is enabled on every public table" runs against Docker
+    // postgres exclusively and was failing because v27 created the new
+    // tables without RLS enabled.
+    sqlFor: {
+      postgres: `
+        DO $$
+        DECLARE
+          has_bypass BOOLEAN;
+        BEGIN
+          SELECT rolbypassrls INTO has_bypass FROM pg_roles WHERE rolname = current_user;
+          IF NOT has_bypass THEN
+            RAISE EXCEPTION 'v29 cathedral_ii_code_edges_rls: role % does not have BYPASSRLS privilege — cannot enable RLS safely. Re-run as postgres (or another BYPASSRLS role). The migration will retry automatically on the next initSchema call.', current_user;
+          END IF;
+
+          ALTER TABLE code_edges_chunk ENABLE ROW LEVEL SECURITY;
+          ALTER TABLE code_edges_symbol ENABLE ROW LEVEL SECURITY;
+
+          RAISE NOTICE 'v29: code_edges RLS enabled (role % has BYPASSRLS)', current_user;
+        END $$;
+      `,
+      pglite: `-- PGLite: no-op. RLS check runs only against Postgres E2E.`,
+    },
+    sql: '',
+  },
+  {
+    version: 30,
+    name: 'dream_verdicts_table',
+    // v0.23 synthesize phase: cache for "is this transcript worth processing?"
+    // verdict from the cheap Haiku judge. Distinct from raw_data (page-scoped);
+    // transcripts aren't pages. Keyed by (file_path, content_hash) so edited
+    // transcripts re-judge automatically. Backfill re-runs hit cache instead
+    // of paying for Haiku 100x.
+    sql: `
+      CREATE TABLE IF NOT EXISTS dream_verdicts (
+        file_path        TEXT        NOT NULL,
+        content_hash     TEXT        NOT NULL,
+        worth_processing BOOLEAN     NOT NULL,
+        reasons          JSONB,
+        judged_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+        PRIMARY KEY (file_path, content_hash)
+      );
+      DO $$
+      DECLARE
+        has_bypass BOOLEAN;
+      BEGIN
+        SELECT rolbypassrls INTO has_bypass FROM pg_roles WHERE rolname = current_user;
+        IF has_bypass THEN
+          ALTER TABLE dream_verdicts ENABLE ROW LEVEL SECURITY;
+        END IF;
+      END $$;
+    `,
+  },
+  {
+    version: 31,
+    name: 'eval_capture_tables',
+    // v0.25.0 — BrainBench-Real session capture substrate.
+    // Two tables:
+    //   eval_candidates: per-call capture from the op-layer wrapper around
+    //     `query` and `search`. Captures MCP + CLI + subagent tool-bridge
+    //     traffic via src/core/operations.ts. query column is CHECK-capped
+    //     at 50KB; PII is scrubbed before insert by src/core/eval-capture-scrub.ts.
+    //     remote distinguishes MCP callers (untrusted) from local CLI; job_id +
+    //     subagent_id let gbrain-evals partition replay by run.
+    //   eval_capture_failures: insert-side audit trail. When logEvalCandidate
+    //     fails (DB down, RLS reject, CHECK violation, scrubber exception),
+    //     the capture path records the reason here so `gbrain doctor` can
+    //     surface silent drops cross-process. In-process counters don't work
+    //     because doctor runs in a separate process from the MCP server.
+    //
+    // RLS enable matches the v24 / v29 posture: fail loudly via RAISE EXCEPTION
+    // if current_user lacks BYPASSRLS, so the migration retries cleanly after
+    // operator fixes the role instead of silently bumping schema_version.
+    // PGLite ignores RLS; sqlFor carries the table+index DDL only.
+    //
+    // Renumbered v30→v31 on merge with master's v0.23.0 (dream_verdicts) which
+    // claimed v30 first. Pre-existing brains that applied our v30 will see
+    // version 31 as new on next initSchema and run the IF NOT EXISTS DDL —
+    // the CREATE TABLE statements are idempotent so the rename is safe.
+    sqlFor: {
+      postgres: `
+        DO $$
+        DECLARE
+          has_bypass BOOLEAN;
+        BEGIN
+          SELECT rolbypassrls INTO has_bypass FROM pg_roles WHERE rolname = current_user;
+          IF NOT has_bypass THEN
+            RAISE EXCEPTION 'v31 eval_capture_tables: role % does not have BYPASSRLS privilege — cannot enable RLS safely. Re-run as postgres (or another BYPASSRLS role). The migration will retry automatically on the next initSchema call.', current_user;
+          END IF;
+
+          CREATE TABLE IF NOT EXISTS eval_candidates (
+            id SERIAL PRIMARY KEY,
+            tool_name TEXT NOT NULL CHECK (tool_name IN ('query', 'search')),
+            query TEXT NOT NULL CHECK (length(query) <= 51200),
+            retrieved_slugs TEXT[] NOT NULL DEFAULT '{}',
+            retrieved_chunk_ids INTEGER[] NOT NULL DEFAULT '{}',
+            source_ids TEXT[] NOT NULL DEFAULT '{}',
+            expand_enabled BOOLEAN,
+            detail TEXT CHECK (detail IS NULL OR detail IN ('low', 'medium', 'high')),
+            detail_resolved TEXT CHECK (detail_resolved IS NULL OR detail_resolved IN ('low', 'medium', 'high')),
+            vector_enabled BOOLEAN NOT NULL,
+            expansion_applied BOOLEAN NOT NULL,
+            latency_ms INTEGER NOT NULL,
+            remote BOOLEAN NOT NULL,
+            job_id INTEGER,
+            subagent_id INTEGER,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+          );
+          CREATE INDEX IF NOT EXISTS idx_eval_candidates_created_at ON eval_candidates (created_at DESC);
+          ALTER TABLE eval_candidates ENABLE ROW LEVEL SECURITY;
+
+          CREATE TABLE IF NOT EXISTS eval_capture_failures (
+            id SERIAL PRIMARY KEY,
+            ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            reason TEXT NOT NULL CHECK (reason IN ('db_down', 'rls_reject', 'check_violation', 'scrubber_exception', 'other'))
+          );
+          CREATE INDEX IF NOT EXISTS idx_eval_capture_failures_ts ON eval_capture_failures (ts DESC);
+          ALTER TABLE eval_capture_failures ENABLE ROW LEVEL SECURITY;
+
+          RAISE NOTICE 'v31: eval_capture tables ready (role % has BYPASSRLS)', current_user;
+        END $$;
+      `,
+      pglite: `
+        CREATE TABLE IF NOT EXISTS eval_candidates (
+          id SERIAL PRIMARY KEY,
+          tool_name TEXT NOT NULL CHECK (tool_name IN ('query', 'search')),
+          query TEXT NOT NULL CHECK (length(query) <= 51200),
+          retrieved_slugs TEXT[] NOT NULL DEFAULT '{}',
+          retrieved_chunk_ids INTEGER[] NOT NULL DEFAULT '{}',
+          source_ids TEXT[] NOT NULL DEFAULT '{}',
+          expand_enabled BOOLEAN,
+          detail TEXT CHECK (detail IS NULL OR detail IN ('low', 'medium', 'high')),
+          detail_resolved TEXT CHECK (detail_resolved IS NULL OR detail_resolved IN ('low', 'medium', 'high')),
+          vector_enabled BOOLEAN NOT NULL,
+          expansion_applied BOOLEAN NOT NULL,
+          latency_ms INTEGER NOT NULL,
+          remote BOOLEAN NOT NULL,
+          job_id INTEGER,
+          subagent_id INTEGER,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        CREATE INDEX IF NOT EXISTS idx_eval_candidates_created_at ON eval_candidates (created_at DESC);
+
+        CREATE TABLE IF NOT EXISTS eval_capture_failures (
+          id SERIAL PRIMARY KEY,
+          ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          reason TEXT NOT NULL CHECK (reason IN ('db_down', 'rls_reject', 'check_violation', 'scrubber_exception', 'other'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_eval_capture_failures_ts ON eval_capture_failures (ts DESC);
+      `,
+    },
+    sql: '',
+  },
+  {
+    version: 32,
+    name: 'oauth_infrastructure',
+    // v0.26 OAuth 2.1 tables for `gbrain serve --http`. Supports client credentials,
+    // authorization code + PKCE, and refresh token rotation. Renumbered from v30
+    // → v32 on merge with master's v0.23 (dream_verdicts at v30) + v0.25
+    // (eval_capture_tables at v31). OAuth is independent of those chains so
+    // ordering doesn't matter beyond version ledger correctness. CREATE TABLE
+    // statements are idempotent so brains that previously applied this at v30
+    // see version 32 as new and run IF NOT EXISTS DDL cleanly.
+    sql: `
+      CREATE TABLE IF NOT EXISTS oauth_clients (
+        client_id               TEXT PRIMARY KEY,
+        client_secret_hash      TEXT,
+        client_name             TEXT NOT NULL,
+        redirect_uris           TEXT[],
+        grant_types             TEXT[] DEFAULT '{"client_credentials"}',
+        scope                   TEXT,
+        token_endpoint_auth_method TEXT,
+        client_id_issued_at     BIGINT,
+        client_secret_expires_at BIGINT,
+        created_at              TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+      CREATE TABLE IF NOT EXISTS oauth_tokens (
+        token_hash   TEXT PRIMARY KEY,
+        token_type   TEXT NOT NULL,
+        client_id    TEXT NOT NULL REFERENCES oauth_clients(client_id) ON DELETE CASCADE,
+        scopes       TEXT[],
+        expires_at   BIGINT,
+        resource     TEXT,
+        created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+      CREATE INDEX IF NOT EXISTS idx_oauth_tokens_expiry ON oauth_tokens(expires_at);
+      CREATE INDEX IF NOT EXISTS idx_oauth_tokens_client ON oauth_tokens(client_id);
+      CREATE TABLE IF NOT EXISTS oauth_codes (
+        code_hash              TEXT PRIMARY KEY,
+        client_id              TEXT NOT NULL REFERENCES oauth_clients(client_id) ON DELETE CASCADE,
+        scopes                 TEXT[],
+        code_challenge         TEXT NOT NULL,
+        code_challenge_method  TEXT NOT NULL DEFAULT 'S256',
+        redirect_uri           TEXT NOT NULL,
+        state                  TEXT,
+        resource               TEXT,
+        expires_at             BIGINT NOT NULL,
+        created_at             TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+      CREATE INDEX IF NOT EXISTS idx_mcp_log_time_agent ON mcp_request_log(created_at, token_name);
+      DO $$
+      DECLARE
+        has_bypass BOOLEAN;
+      BEGIN
+        SELECT rolbypassrls INTO has_bypass FROM pg_roles WHERE rolname = current_user;
+        IF has_bypass THEN
+          ALTER TABLE oauth_clients ENABLE ROW LEVEL SECURITY;
+          ALTER TABLE oauth_tokens ENABLE ROW LEVEL SECURITY;
+          ALTER TABLE oauth_codes ENABLE ROW LEVEL SECURITY;
+        ELSE
+          RAISE WARNING 'v32: role % lacks BYPASSRLS — skipping RLS on OAuth tables. Re-run as postgres (or a BYPASSRLS role) to harden.', current_user;
+        END IF;
+      END $$;
+    `,
+  },
+  {
+    version: 33,
+    name: 'admin_dashboard_columns_v0_26_3',
+    // v0.26.3 admin dashboard expansion. Adds 5 columns referenced by
+    // src/commands/serve-http.ts and src/core/oauth-provider.ts that landed
+    // in PR #586 without a corresponding schema migration. Without v33,
+    // existing brains hit:
+    //   - SELECT c.token_ttl, ... CASE WHEN c.deleted_at -> 503 on /admin/api/agents
+    //   - INSERT INTO mcp_request_log (... agent_name, params, error_message)
+    //     -> caught by best-effort try/catch, request log silently empties
+    //   - UPDATE oauth_clients SET deleted_at = now() (revoke-client) -> 500
+    //   - UPDATE oauth_clients SET token_ttl = ... (update-client-ttl) -> 500
+    // All ALTERs use ADD COLUMN IF NOT EXISTS so re-running is a no-op.
+    sql: `
+      ALTER TABLE oauth_clients
+        ADD COLUMN IF NOT EXISTS token_ttl INTEGER,
+        ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+
+      ALTER TABLE mcp_request_log
+        ADD COLUMN IF NOT EXISTS agent_name TEXT,
+        ADD COLUMN IF NOT EXISTS params JSONB,
+        ADD COLUMN IF NOT EXISTS error_message TEXT;
+
+      -- Backfill agent_name on existing rows so the new "agent" column in
+      -- the request log isn't blank for pre-v0.26.3 entries. LEFT JOIN
+      -- pattern: prefer client_name from oauth_clients (current behavior),
+      -- fall back to access_tokens.name (legacy bearer tokens), fall back
+      -- to the raw client_id stored as token_name.
+      UPDATE mcp_request_log m
+      SET agent_name = COALESCE(
+        (SELECT client_name FROM oauth_clients WHERE client_id = m.token_name LIMIT 1),
+        (SELECT name FROM access_tokens WHERE name = m.token_name LIMIT 1),
+        m.token_name
+      )
+      WHERE agent_name IS NULL;
+
+      -- Index for the new agent filter on /admin/api/request-log. The
+      -- existing idx_mcp_log_time_agent (created_at, token_name) doesn't
+      -- help when filtering by the resolved agent_name. Use DESC on
+      -- created_at to match the typical ORDER BY clause.
+      CREATE INDEX IF NOT EXISTS idx_mcp_log_agent_time
+        ON mcp_request_log(agent_name, created_at DESC);
+    `,
+  },
+  {
+    version: 34,
+    name: 'destructive_guard_columns',
+    // v0.26.5 — soft-delete + recovery window for sources AND pages.
+    // Renumbered v33→v34 on master merge: master's v33 (admin_dashboard_columns_v0_26_3)
+    // landed first in PR #586. v34 follows it.
+    //
+    // pages.deleted_at: `delete_page` op now sets deleted_at = now() instead of
+    // hard-deleting. The autopilot purge phase hard-deletes rows where
+    // deleted_at < now() - 72h. Search and `get_page` filter
+    // `WHERE deleted_at IS NULL` by default; `include_deleted: true` opts in.
+    //
+    // sources.archived/archived_at/archive_expires_at: promoted from JSONB keys
+    // to real columns. v0.26.0 + the cherry-picked PR #595 wrote these inside
+    // `sources.config` JSONB. Real columns are faster to filter, avoid the
+    // reserved-key footgun, and let the search visibility filter compile to a
+    // column lookup. The 72h TTL is preserved by reading
+    // `archive_expires_at = archived_at + INTERVAL '72 hours'`.
+    //
+    // Backfill: any row that previously stored `{"archived":true,"archived_at":"...","archive_expires_at":"..."}`
+    // in config gets migrated to the new columns, then the keys are stripped
+    // from JSONB so the JSONB shape stays canonical going forward.
+    //
+    // Engine-aware partial index: Postgres uses CREATE INDEX CONCURRENTLY (no
+    // write-blocking lock); PGLite uses plain CREATE INDEX. Mirrors v14
+    // (pages_updated_at_index) handler shape.
+    sql: '',
+    handler: async (engine) => {
+      // 1. Add columns. ALTER TABLE ADD COLUMN IF NOT EXISTS is idempotent on
+      //    both engines.
+      await engine.runMigration(34, `
+        ALTER TABLE pages   ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+        ALTER TABLE sources ADD COLUMN IF NOT EXISTS archived           BOOLEAN     NOT NULL DEFAULT false;
+        ALTER TABLE sources ADD COLUMN IF NOT EXISTS archived_at        TIMESTAMPTZ;
+        ALTER TABLE sources ADD COLUMN IF NOT EXISTS archive_expires_at TIMESTAMPTZ;
+      `);
+
+      // 2. Backfill from JSONB shape used by pre-v0.26.5 cherry-picks of PR #595.
+      //    Idempotent: subsequent re-runs find zero matching rows.
+      await engine.runMigration(34, `
+        UPDATE sources
+        SET archived = true,
+            archived_at = COALESCE((config->>'archived_at')::timestamptz, now()),
+            archive_expires_at = COALESCE(
+              (config->>'archive_expires_at')::timestamptz,
+              COALESCE((config->>'archived_at')::timestamptz, now()) + INTERVAL '72 hours'
+            )
+        WHERE config ? 'archived'
+          AND (config->>'archived')::boolean = true
+          AND archived = false;
+      `);
+      await engine.runMigration(34, `
+        UPDATE sources
+        SET config = config - 'archived' - 'archived_at' - 'archive_expires_at'
+        WHERE config ?| ARRAY['archived', 'archived_at', 'archive_expires_at'];
+      `);
+
+      // 3. Partial index for the autopilot purge sweep. Postgres CONCURRENTLY
+      //    avoids the SHARE lock on `pages`; PGLite has no concurrent writers.
+      if (engine.kind === 'postgres') {
+        // Pre-drop any invalid index from a prior CONCURRENTLY failure (matches v14 pattern).
+        await engine.runMigration(34, `
+          DO $$ BEGIN
+            IF EXISTS (
+              SELECT 1 FROM pg_index i
+              JOIN pg_class c ON c.oid = i.indexrelid
+              WHERE c.relname = 'pages_deleted_at_purge_idx' AND NOT i.indisvalid
+            ) THEN
+              EXECUTE 'DROP INDEX CONCURRENTLY IF EXISTS pages_deleted_at_purge_idx';
+            END IF;
+          END $$;
+        `);
+        await engine.runMigration(34, `
+          CREATE INDEX CONCURRENTLY IF NOT EXISTS pages_deleted_at_purge_idx
+            ON pages (deleted_at) WHERE deleted_at IS NOT NULL;
+        `);
+      } else {
+        await engine.runMigration(34, `
+          CREATE INDEX IF NOT EXISTS pages_deleted_at_purge_idx
+            ON pages (deleted_at) WHERE deleted_at IS NOT NULL;
+        `);
+      }
+    },
+    // CONCURRENTLY on Postgres requires no surrounding transaction. PGLite ignores
+    // this flag, so the index DDL runs in whatever wrapper applies.
+    transaction: false,
   },
 ];
 

@@ -1,6 +1,6 @@
 import type {
-  Page, PageInput, PageFilters,
-  Chunk, ChunkInput,
+  Page, PageInput, PageFilters, GetPageOpts,
+  Chunk, ChunkInput, StaleChunkRow,
   SearchResult, SearchOpts,
   Link, GraphNode, GraphPath,
   TimelineEntry, TimelineInput, TimelineOpts,
@@ -9,6 +9,9 @@ import type {
   BrainStats, BrainHealth,
   IngestLogEntry, IngestLogInput,
   EngineConfig,
+  CodeEdgeInput, CodeEdgeResult,
+  EvalCandidate, EvalCandidateInput,
+  EvalCaptureFailure, EvalCaptureFailureReason,
 } from './types.ts';
 
 /** Input row for addLinksBatch. Optional fields default to '' (matches NOT NULL DDL). */
@@ -85,6 +88,19 @@ export interface ReservedConnection {
   executeRaw<T = Record<string, unknown>>(sql: string, params?: unknown[]): Promise<T[]>;
 }
 
+/** Dream-cycle Haiku verdict on whether a transcript is worth processing. */
+export interface DreamVerdict {
+  worth_processing: boolean;
+  reasons: string[];
+  judged_at: string;
+}
+
+/** Input shape for putDreamVerdict — judged_at defaults to now() server-side. */
+export interface DreamVerdictInput {
+  worth_processing: boolean;
+  reasons: string[];
+}
+
 /** Maximum results returned by search operations. Internal bulk operations (listPages) are not clamped. */
 export const MAX_SEARCH_LIMIT = 100;
 
@@ -112,9 +128,48 @@ export interface BrainEngine {
   withReservedConnection<T>(fn: (conn: ReservedConnection) => Promise<T>): Promise<T>;
 
   // Pages CRUD
-  getPage(slug: string): Promise<Page | null>;
+  /**
+   * Fetch a page by slug.
+   * v0.26.5: by default soft-deleted rows return null (matches the search
+   * filter contract). Pass `opts.includeDeleted: true` to surface them with
+   * `deleted_at` populated — used by `gbrain pages purge-deleted` listing,
+   * by `restore_page` flow, and by operator diagnostics.
+   */
+  getPage(slug: string, opts?: GetPageOpts): Promise<Page | null>;
   putPage(slug: string, page: PageInput): Promise<Page>;
+  /**
+   * Hard-delete a page row. Cascades to content_chunks, page_links,
+   * chunk_relations via existing FK ON DELETE CASCADE.
+   *
+   * v0.26.5: this is no longer the public-facing `delete_page` op handler —
+   * the op now soft-deletes via `softDeletePage` instead. `deletePage` stays
+   * as the underlying primitive used by `purgeDeletedPages` and by callers
+   * that explicitly want hard-delete semantics (e.g. test setup teardown).
+   */
   deletePage(slug: string): Promise<void>;
+  /**
+   * v0.26.5 — set `deleted_at = now()` on a page. Returns the slug if a row
+   * was soft-deleted, null if no row matched (already soft-deleted OR not found).
+   * Idempotent-as-null. The page stays in the DB and cascade rows (chunks,
+   * links) stay intact; the autopilot purge phase hard-deletes after 72h.
+   */
+  softDeletePage(slug: string, opts?: { sourceId?: string }): Promise<{ slug: string } | null>;
+  /**
+   * v0.26.5 — clear `deleted_at` on a soft-deleted page. Returns true iff a
+   * row was restored. False if the slug is unknown OR the page is not
+   * currently soft-deleted (idempotent-as-false).
+   */
+  restorePage(slug: string, opts?: { sourceId?: string }): Promise<boolean>;
+  /**
+   * v0.26.5 — hard-delete pages whose `deleted_at` is older than the cutoff.
+   * Called by the autopilot purge phase and by the `gbrain pages purge-deleted`
+   * CLI escape hatch. Cascades through existing FKs.
+   */
+  purgeDeletedPages(olderThanHours: number): Promise<{ slugs: string[]; count: number }>;
+  /**
+   * v0.26.5: by default `listPages` excludes soft-deleted rows. Set
+   * `filters.includeDeleted: true` to surface them.
+   */
   listPages(filters?: PageFilters): Promise<Page[]>;
   resolveSlugs(partial: string): Promise<string[]>;
   /**
@@ -132,6 +187,21 @@ export interface BrainEngine {
   // Chunks
   upsertChunks(slug: string, chunks: ChunkInput[]): Promise<void>;
   getChunks(slug: string): Promise<Chunk[]>;
+  /**
+   * Count chunks across the entire brain where embedded_at IS NULL.
+   * Pre-flight short-circuit for `embed --stale` so a 100%-embedded brain
+   * does no further work after a single SELECT count(*) (~50 bytes wire).
+   */
+  countStaleChunks(): Promise<number>;
+  /**
+   * Return every chunk where embedded_at IS NULL, with the metadata needed
+   * to call embedBatch + upsertChunks. The `embedding` column is omitted
+   * by design — stale rows have NULL embeddings, so shipping them wastes
+   * wire bytes for no gain. Caller groups by slug, embeds, and re-upserts.
+   *
+   * Bounded by an internal LIMIT of 100000 to mirror listPages.
+   */
+  listStaleChunks(): Promise<StaleChunkRow[]>;
   deleteChunks(slug: string): Promise<void>;
 
   // Links
@@ -242,6 +312,12 @@ export interface BrainEngine {
   putRawData(slug: string, source: string, data: object): Promise<void>;
   getRawData(slug: string, source?: string): Promise<RawData[]>;
 
+  // Dream-cycle significance verdict cache (v0.23).
+  // Keyed by (file_path, content_hash). Distinct from raw_data, which is
+  // page-scoped — transcripts being judged aren't pages yet.
+  getDreamVerdict(filePath: string, contentHash: string): Promise<DreamVerdict | null>;
+  putDreamVerdict(filePath: string, contentHash: string, verdict: DreamVerdictInput): Promise<void>;
+
   // Versions
   createVersion(slug: string): Promise<PageVersion>;
   getVersions(slug: string): Promise<PageVersion[]>;
@@ -269,4 +345,79 @@ export interface BrainEngine {
 
   // Raw SQL (for Minions job queue and other internal modules)
   executeRaw<T = Record<string, unknown>>(sql: string, params?: unknown[]): Promise<T[]>;
+
+  // ============================================================
+  // v0.20.0 Cathedral II: code edges (Layer 5 populates, Layer 7 consumes)
+  // ============================================================
+  /**
+   * Bulk-insert code edges. Resolved edges (to_chunk_id set) land in
+   * code_edges_chunk; unresolved refs (to_chunk_id null, to_symbol_qualified
+   * set) land in code_edges_symbol. ON CONFLICT DO NOTHING handles idempotency.
+   * Returns count of rows actually inserted.
+   */
+  addCodeEdges(edges: CodeEdgeInput[]): Promise<number>;
+
+  /**
+   * Delete all code edges involving these chunk IDs, in BOTH directions, across
+   * both code_edges_chunk and code_edges_symbol. Called by importCodeFile on
+   * per-chunk invalidation (codex SP-2): when a chunk's text changed, stale
+   * inbound edges from other pages pointing at the old symbol must wipe before
+   * new edges write.
+   */
+  deleteCodeEdgesForChunks(chunkIds: number[]): Promise<void>;
+
+  /**
+   * "Who calls this symbol?" Returns UNION of code_edges_chunk +
+   * code_edges_symbol matching `to_symbol_qualified = qualifiedName`.
+   * Source scoping (codex SP-3): if opts.sourceId is set, filter by the
+   * anchor chunk's source; if opts.allSources, ignore scoping.
+   */
+  getCallersOf(
+    qualifiedName: string,
+    opts?: { sourceId?: string; allSources?: boolean; limit?: number },
+  ): Promise<CodeEdgeResult[]>;
+
+  /**
+   * "What does this symbol call?" Returns edges from chunks whose
+   * from_symbol_qualified = qualifiedName. Same source-scoping semantics
+   * as getCallersOf.
+   */
+  getCalleesOf(
+    qualifiedName: string,
+    opts?: { sourceId?: string; allSources?: boolean; limit?: number },
+  ): Promise<CodeEdgeResult[]>;
+
+  /**
+   * All edges touching a chunk in the given direction. Used by A2 two-pass
+   * retrieval to expand from anchor chunks. direction='in' returns edges
+   * pointing AT the chunk; 'out' returns edges FROM it; 'both' unions.
+   */
+  getEdgesByChunk(
+    chunkId: number,
+    opts?: { direction?: 'in' | 'out' | 'both'; edgeType?: string; limit?: number },
+  ): Promise<CodeEdgeResult[]>;
+
+  /**
+   * Chunk-grain keyword search. Ranks by content_chunks.search_vector
+   * without the dedup-to-page pass that searchKeyword applies. Consumed
+   * by A2 two-pass retrieval as its anchor source. Most callers should
+   * prefer searchKeyword (external contract: page-grain best-chunk-per-page).
+   */
+  searchKeywordChunks(query: string, opts?: SearchOpts): Promise<SearchResult[]>;
+
+  // Eval capture (v0.25.0 — BrainBench-Real substrate).
+  // Captured at the op-layer wrapper in src/core/operations.ts; reads via
+  // `gbrain eval export` (NDJSON) for sibling gbrain-evals consumption.
+  // Adding these to BrainEngine is a breaking-interface change for third-
+  // party engine implementers — this is why v0.25.0 is a minor bump.
+  /** Insert a captured candidate. Returns the new row id. Best-effort: callers swallow failures and route them through `logEvalCaptureFailure`. */
+  logEvalCandidate(input: EvalCandidateInput): Promise<number>;
+  /** Read candidates by time window / limit / tool filter. Used by `gbrain eval export`. */
+  listEvalCandidates(filter?: { since?: Date; limit?: number; tool?: 'query' | 'search' }): Promise<EvalCandidate[]>;
+  /** Delete candidates created before `date`. Returns rows deleted. Used by `gbrain eval prune`. */
+  deleteEvalCandidatesBefore(date: Date): Promise<number>;
+  /** Log a capture failure so `gbrain doctor` can surface drops cross-process. Best-effort; symmetric with logEvalCandidate (failure-of-failure is lost). */
+  logEvalCaptureFailure(reason: EvalCaptureFailureReason): Promise<void>;
+  /** Read capture failures within an optional time window. Used by `gbrain doctor`. */
+  listEvalCaptureFailures(filter?: { since?: Date }): Promise<EvalCaptureFailure[]>;
 }

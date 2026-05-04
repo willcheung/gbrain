@@ -5,6 +5,7 @@ import { checkResolvable } from '../core/check-resolvable.ts';
 import { autoFixDryViolations, type AutoFixReport, type FixOutcome } from '../core/dry-fix.ts';
 import { findRepoRoot } from '../core/repo-root.ts';
 import { loadCompletedMigrations } from '../core/preferences.ts';
+import { compareVersions } from './migrations/index.ts';
 import { createProgress, startHeartbeat, type ProgressReporter } from '../core/progress.ts';
 import { getCliOptions, cliOptsToProgressOptions } from '../core/cli-options.ts';
 import type { DbUrlSource } from '../core/config.ts';
@@ -110,6 +111,15 @@ export async function runDoctor(engine: BrainEngine | null, args: string[], dbSo
   // Typical cause: v0.11.0 stopgap wrote a partial record but nobody ran
   // `gbrain apply-migrations --yes` afterward. This check fires on every
   // `gbrain doctor` invocation so your OpenClaw's health skill catches it.
+  //
+  // Forward-progress override: a partial entry for vX.Y.Z is treated as
+  // stale (not stuck) if there is a `complete` entry for any vA.B.C >= vX.Y.Z
+  // anywhere in the file. The reasoning: if a newer migration successfully
+  // landed, the install moved past the older partial — the old record is
+  // historical noise from a stopgap that never finished cleanly, but the
+  // schema clearly advanced. Without this, every install that went through
+  // a v0.11.0 stopgap and then upgraded carries the "MINIONS HALF-INSTALLED"
+  // flag forever, even on installs that have been at v0.22+ for months.
   try {
     const completed = loadCompletedMigrations();
     const byVersion = new Map<string, { complete: boolean; partial: boolean }>();
@@ -119,8 +129,17 @@ export async function runDoctor(engine: BrainEngine | null, args: string[], dbSo
       if (entry.status === 'partial') seen.partial = true;
       byVersion.set(entry.version, seen);
     }
+    const completedVersions = Array.from(byVersion.entries())
+      .filter(([, s]) => s.complete)
+      .map(([v]) => v);
     const stuck = Array.from(byVersion.entries())
-      .filter(([, s]) => s.partial && !s.complete)
+      .filter(([v, s]) => {
+        if (!s.partial || s.complete) return false;
+        // Forward-progress override: if any version >= v has completed, the
+        // partial is stale. compareVersions returns 1 when first arg is newer.
+        const supersededBy = completedVersions.find(cv => compareVersions(cv, v) >= 0);
+        return supersededBy === undefined;
+      })
       .map(([v]) => v);
     if (stuck.length > 0) {
       checks.push({
@@ -230,25 +249,29 @@ export async function runDoctor(engine: BrainEngine | null, args: string[], dbSo
   // Without this doctor check, users see "sync blocked" and have no
   // surface showing which files to fix.
   try {
-    const { unacknowledgedSyncFailures, loadSyncFailures } = await import('../core/sync.ts');
+    const { unacknowledgedSyncFailures, loadSyncFailures, summarizeFailuresByCode } = await import('../core/sync.ts');
     const unacked = unacknowledgedSyncFailures();
     const all = loadSyncFailures();
     if (unacked.length > 0) {
+      const codeSummary = summarizeFailuresByCode(unacked);
+      const codeBreakdown = codeSummary.map(s => `${s.code}=${s.count}`).join(', ');
       const preview = unacked.slice(0, 3).map(f => `${f.path} (${f.error.slice(0, 60)})`).join('; ');
       checks.push({
         name: 'sync_failures',
         status: 'warn',
         message:
-          `${unacked.length} unacknowledged sync failure(s). ${preview}` +
+          `${unacked.length} unacknowledged sync failure(s) [${codeBreakdown}]. ${preview}` +
           `${unacked.length > 3 ? `, and ${unacked.length - 3} more` : ''}. ` +
           `Fix the file(s) and re-run 'gbrain sync', or use 'gbrain sync --skip-failed' to acknowledge.`,
       });
     } else if (all.length > 0) {
-      // Acknowledged-only: informational, not a warning.
+      // Acknowledged-only: show code breakdown for visibility.
+      const ackedSummary = summarizeFailuresByCode(all);
+      const ackedBreakdown = ackedSummary.map(s => `${s.code}=${s.count}`).join(', ');
       checks.push({
         name: 'sync_failures',
         status: 'ok',
-        message: `${all.length} historical sync failure(s), all acknowledged.`,
+        message: `${all.length} historical sync failure(s), all acknowledged [${ackedBreakdown}].`,
       });
     }
   } catch {
@@ -649,6 +672,105 @@ export async function runDoctor(engine: BrainEngine | null, args: string[], dbSo
     mbcHb();
   }
 
+  // 11a. Frontmatter integrity (v0.22.4).
+  // scanBrainSources walks every registered source's local_path on disk
+  // (not from the DB), invoking parseMarkdown(..., {validate:true}) per
+  // file. Reports per-source counts grouped by error code. The fix path is
+  // `gbrain frontmatter validate <source-path> --fix`, which writes .bak
+  // backups so it works for both git and non-git brain repos.
+  progress.heartbeat('frontmatter_integrity');
+  const fmHb = startHeartbeat(progress, 'scanning frontmatter…');
+  try {
+    const { scanBrainSources } = await import('../core/brain-writer.ts');
+    const report = await scanBrainSources(engine);
+    if (report.total === 0) {
+      const sources = report.per_source.length;
+      checks.push({
+        name: 'frontmatter_integrity',
+        status: 'ok',
+        message: sources === 0
+          ? 'No registered sources to scan'
+          : `${sources} source(s) clean — no frontmatter issues`,
+      });
+    } else {
+      const sourceMessages: string[] = [];
+      for (const src of report.per_source) {
+        if (src.total === 0) continue;
+        const codes = Object.entries(src.errors_by_code)
+          .map(([k, v]) => `${k}=${v}`)
+          .join(', ');
+        sourceMessages.push(`${src.source_id}: ${src.total} (${codes})`);
+      }
+      checks.push({
+        name: 'frontmatter_integrity',
+        status: 'warn',
+        message:
+          `${report.total} frontmatter issue(s) across ${sourceMessages.length} source(s). ` +
+          `${sourceMessages.join('; ')}. Fix: gbrain frontmatter validate <source-path> --fix`,
+      });
+    }
+  } catch (e) {
+    checks.push({
+      name: 'frontmatter_integrity',
+      status: 'warn',
+      message: `Could not scan frontmatter: ${e instanceof Error ? e.message : String(e)}`,
+    });
+  } finally {
+    fmHb();
+  }
+
+  // 11a-bis. Eval-capture health (v0.25.0). Capture is a fire-and-forget
+  // side-effect that logs failures to a persistent table so this check
+  // can see drops cross-process (the MCP server captures; `gbrain doctor`
+  // runs in a separate process). Counts failures in the last 24h and
+  // warns when non-zero. Pre-v31 brains: the table doesn't exist yet;
+  // swallow the error and report skipped.
+  progress.heartbeat('eval_capture');
+  try {
+    const since = new Date(Date.now() - 24 * 3600 * 1000);
+    const failures = await engine.listEvalCaptureFailures({ since });
+    if (failures.length === 0) {
+      checks.push({ name: 'eval_capture', status: 'ok', message: 'No capture failures in the last 24h' });
+    } else {
+      const byReason = new Map<string, number>();
+      for (const f of failures) {
+        byReason.set(f.reason, (byReason.get(f.reason) ?? 0) + 1);
+      }
+      const breakdown = [...byReason.entries()]
+        .sort((a, b) => b[1] - a[1])
+        .map(([r, n]) => `${n} ${r}`)
+        .join(', ');
+      checks.push({
+        name: 'eval_capture',
+        status: 'warn',
+        message: `${failures.length} capture failure(s) in the last 24h (${breakdown}). ` +
+          `If you care about replay fidelity, investigate. If not, set eval.capture: false ` +
+          `in ~/.gbrain/config.json to silence.`,
+      });
+    }
+  } catch (err) {
+    // Distinguish "table doesn't exist yet" (pre-v31, ok skip) from real
+    // problems like RLS denying SELECT — the latter masks the very condition
+    // this check is supposed to surface (capture INSERTs almost certainly
+    // also fail).
+    const code = (err as { code?: string } | null)?.code;
+    if (code === '42P01') {
+      checks.push({ name: 'eval_capture', status: 'ok', message: 'Skipped (eval_capture_failures table unavailable — apply migrations or upgrade)' });
+    } else if (code === '42501') {
+      checks.push({
+        name: 'eval_capture',
+        status: 'warn',
+        message: 'RLS denies SELECT on eval_capture_failures. Capture INSERTs are almost certainly failing too. Run as a role with BYPASSRLS or grant SELECT on this table.',
+      });
+    } else {
+      checks.push({
+        name: 'eval_capture',
+        status: 'warn',
+        message: `Could not read eval_capture_failures: ${(err as Error)?.message ?? String(err)}`,
+      });
+    }
+  }
+
   // 11b. Queue health (v0.19.1 queue-resilience wave).
   // Postgres-only because PGLite has no multi-process worker surface. Two
   // subchecks, both cheap (single SELECT each, status-index-covered):
@@ -704,6 +826,30 @@ export async function runDoctor(engine: BrainEngine | null, args: string[], dbSo
          ORDER BY depth DESC
          LIMIT 5
       `;
+      // Subcheck 3 (v0.22.14): RSS-watchdog kills in the last 24h. Bare workers
+      // newly default to --max-rss 2048 (was 0); operators who run large embed
+      // or import jobs may see kills that didn't happen pre-v0.22.14. We surface
+      // a hint when this signature appears so the upgrade path is obvious.
+      // Signature: when the watchdog trips, gracefulShutdown('watchdog') aborts
+      // in-flight jobs with `new Error('watchdog')`. The worker's failJob path
+      // (worker.ts:660-664) writes `error_text = 'aborted: watchdog'` for any
+      // job in-flight at the moment of the kill.
+      //
+      // We deliberately DO NOT do a loose `ILIKE '%watchdog%'`:
+      //   1. Parent jobs that inherit `on_child_fail='fail_parent'` get
+      //      `"child job N failed: aborted: watchdog"` — counting that
+      //      double-counts (child + parent) for one watchdog event.
+      //   2. Any user error_text containing the word "watchdog" matches.
+      // Match the exact prefix `'aborted: watchdog'` to scope this purely to
+      // the worker's own kill signature.
+      const rssKillRows: Array<{ cnt: number }> = await sql`
+        SELECT count(*)::int AS cnt
+          FROM minion_jobs
+         WHERE status IN ('dead', 'failed')
+           AND finished_at > now() - interval '24 hours'
+           AND error_text = 'aborted: watchdog'
+      `;
+      const rssKillCount = rssKillRows[0]?.cnt ?? 0;
 
       const problems: string[] = [];
       if (stalledRows.length > 0) {
@@ -722,6 +868,14 @@ export async function runDoctor(engine: BrainEngine | null, args: string[], dbSo
         problems.push(
           `waiting-queue depth exceeds ${threshold} for: ${sample}. ` +
           `Fix: set maxWaiting on the submitter (or raise GBRAIN_QUEUE_WAITING_THRESHOLD).`
+        );
+      }
+      if (rssKillCount > 0) {
+        problems.push(
+          `${rssKillCount} job(s) dead-lettered for RSS-watchdog memory-limit kills in last 24h. ` +
+          `v0.22.14 changed the bare-worker --max-rss default from 0 (off) to 2048 MB. ` +
+          `Fix: raise the limit (e.g. \`gbrain jobs work --max-rss 4096\`) or opt out (\`--max-rss 0\`). ` +
+          `See skills/migrations/v0.22.14.md.`
         );
       }
 

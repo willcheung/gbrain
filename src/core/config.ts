@@ -19,9 +19,11 @@ export type DbUrlSource =
   | 'config-file-path' // PGLite: config file present, no URL but database_path set
   | null;
 
-// Lazy-evaluated to avoid calling homedir() at module scope (breaks in serverless/bundled environments)
-function getConfigDir() { return join(homedir(), '.gbrain'); }
-function getConfigPath() { return join(getConfigDir(), 'config.json'); }
+// Internal aliases retained for backwards compatibility with the existing call
+// sites below. They forward to the exported configDir()/configPath() so
+// GBRAIN_HOME is honored uniformly. Lazy: never call homedir() at module scope.
+function getConfigDir() { return configDir(); }
+function getConfigPath() { return configPath(); }
 
 export interface GBrainConfig {
   engine: 'postgres' | 'pglite';
@@ -36,6 +38,18 @@ export interface GBrainConfig {
    * validates the shape at runtime.
    */
   storage?: unknown;
+  /**
+   * v0.25.0 — session capture settings. Read via file-plane `loadConfig()`
+   * at process boot (NOT `gbrain config set` which writes the DB plane —
+   * those are different stores). Edit `~/.gbrain/config.json` directly.
+   * All fields default to ON — capture and scrubbing both opt-out.
+   */
+  eval?: {
+    /** false disables capture entirely. Defaults to true. */
+    capture?: boolean;
+    /** false disables PII scrubbing before insert. Defaults to true. */
+    scrub_pii?: boolean;
+  };
 }
 
 /**
@@ -87,11 +101,36 @@ export function toEngineConfig(config: GBrainConfig): EngineConfig {
 }
 
 export function configDir(): string {
+  // Allow override for tests, Docker, and multi-tenant deployments.
+  // GBRAIN_HOME is a parent dir; we always append '.gbrain' ourselves so
+  // setting GBRAIN_HOME=/tmp/x yields configDir() === '/tmp/x/.gbrain'.
+  // Validates the override: must be absolute, no '..' segments.
+  const override = process.env.GBRAIN_HOME;
+  if (override && override.trim()) {
+    const trimmed = override.trim();
+    if (!trimmed.startsWith('/')) {
+      throw new Error(`GBRAIN_HOME must be an absolute path; got: ${trimmed}`);
+    }
+    if (trimmed.split('/').includes('..')) {
+      throw new Error(`GBRAIN_HOME must not contain '..' segments; got: ${trimmed}`);
+    }
+    return join(trimmed, '.gbrain');
+  }
   return join(homedir(), '.gbrain');
 }
 
 export function configPath(): string {
   return join(configDir(), 'config.json');
+}
+
+/**
+ * Sugar for joining paths under the active gbrain home. Use this anywhere you
+ * would otherwise write `join(homedir(), '.gbrain', ...rest)`. Honors
+ * GBRAIN_HOME, validates input, and centralizes the convention so future
+ * audits stay simple.
+ */
+export function gbrainPath(...segments: string[]): string {
+  return join(configDir(), ...segments);
 }
 
 /**

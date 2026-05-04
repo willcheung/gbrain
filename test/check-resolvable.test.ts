@@ -255,6 +255,33 @@ describe("DRY detection — checkResolvable", () => {
   });
 });
 
+describe("v0.22.4 regression — actual repo skills/ has 0 errors", () => {
+  test("repo skills/ pass check-resolvable cleanly (errors only)", () => {
+    // The contract for v0.22.4 (Part A) was: zero warnings AND zero
+    // errors against the actual checked-in skills/ tree.
+    //
+    // v0.25.1 update: warnings of type "routing_miss" are now
+    // ALLOWED. They surface naturally when routing-eval intents are
+    // paraphrased per the D-CX-6 rule (intent must paraphrase the
+    // trigger, not copy it). The structural matcher requires
+    // substring-match against triggers; natural paraphrases legitimately
+    // miss. The LLM tie-break layer (placeholder per v0.24.0) is the
+    // intended fix when it ships. Until then, routing_miss is an
+    // honest warning rather than a regression signal.
+    //
+    // Other warning types (trigger overlap, DRY violations, filing-
+    // rule misses, etc.) STILL fail this test. The test's regression-
+    // guard intent against those is preserved.
+    const report = checkResolvable(SKILLS_DIR);
+    const errors = report.issues.filter(i => i.severity === "error");
+    const nonRoutingWarnings = report.issues.filter(
+      i => i.severity === "warning" && i.type !== "routing_miss",
+    );
+    expect(errors).toEqual([]);
+    expect(nonRoutingWarnings).toEqual([]);
+  });
+});
+
 // bun:test has no beforeEach/afterEach at module scope cleanly interacting
 // with closures; a small helper keeps cleanup readable and per-test.
 function afterEachCleanup(fn: () => void) {
