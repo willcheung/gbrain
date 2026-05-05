@@ -30,6 +30,8 @@ Everything runs in a single Postgres instance. No Neo4j, no Pinecone, no Weaviat
 
 **"Prep me for my QBR with Acme next Tuesday"** — Pulls the account dossier, recent tickets, open feature requests, last call summary, renewal date, and any escalation history. You walk in knowing what they care about.
 
+**"I'm meeting with RBC next week. Give me a list of things they asked for — what we completed and what's still pending — and help me prep for the meeting."** — The brain searches across UserVoice requests, Gong call transcripts, JIRA tickets, and account data for RBC. It returns a categorized list: features shipped, tickets resolved, requests still open, and anything escalated. You get a ready-to-present status update with JIRA links, revenue context, and talking points — no manual cross-referencing across five tools.
+
 **"What changed since last sprint across all teams?"** — JIRA status reports consolidated into one view. No chasing PMs in three different channels.
 
 **"Are customers actually asking for what we're building?"** — Cross-reference your roadmap against real customer requests, call transcripts, and ticket trends. Validate priorities with data, not gut feel.
