@@ -108,11 +108,10 @@ export async function hybridSearch(
     console.error(`[search-debug] auto-detail=${detail} for query="${query}"`);
   }
 
-  // Run keyword search (always available, no API key needed)
-  const keywordResults = await engine.searchKeyword(query, searchOpts);
-
   // Skip vector search entirely if no OpenAI key is configured
   if (!process.env.OPENAI_API_KEY) {
+    // Keyword-only path
+    const keywordResults = await engine.searchKeyword(query, searchOpts);
     // Apply backlink boost in keyword-only path too. One getBacklinkCounts query
     // per search request; not N+1.
     if (keywordResults.length > 0) {
@@ -129,33 +128,46 @@ export async function hybridSearch(
     return dedupResults(keywordResults).slice(offset, offset + limit);
   }
 
-  // Determine query variants (optionally with expansion)
-  // expandQuery already includes the original query in its return value,
-  // so we use it directly instead of prepending query again
-  let queries = [query];
-  if (opts?.expansion && opts?.expandFn) {
-    try {
-      queries = await opts.expandFn(query);
-      if (queries.length === 0) queries = [query];
-      // "Applied" = produced variants beyond the original, not just called.
-      expansionApplied = queries.length > 1;
-    } catch {
-      // Expansion failure is non-fatal
-    }
-  }
+  // Run keyword search, expansion, and embedding in parallel.
+  // Keyword search hits Postgres FTS while expansion calls Haiku + OpenAI
+  // embeddings — no shared resources, so they benefit from concurrency.
+  const keywordPromise = engine.searchKeyword(query, searchOpts);
 
-  // Embed all query variants and run vector search
-  let vectorLists: SearchResult[][] = [];
-  let queryEmbedding: Float32Array | null = null;
-  try {
-    const embeddings = await Promise.all(queries.map(q => embed(q)));
-    queryEmbedding = embeddings[0];
-    vectorLists = await Promise.all(
-      embeddings.map(emb => engine.searchVector(emb, searchOpts)),
-    );
-  } catch {
-    // Embedding failure is non-fatal, fall back to keyword-only
-  }
+  const vectorPromise = (async () => {
+    // Determine query variants (optionally with expansion)
+    // expandQuery already includes the original query in its return value,
+    // so we use it directly instead of prepending query again
+    let queries = [query];
+    if (opts?.expansion && opts?.expandFn) {
+      try {
+        queries = await opts.expandFn(query);
+        if (queries.length === 0) queries = [query];
+        // "Applied" = produced variants beyond the original, not just called.
+        expansionApplied = queries.length > 1;
+      } catch {
+        // Expansion failure is non-fatal
+      }
+    }
+
+    // Embed all query variants and run vector search
+    let vectorLists: SearchResult[][] = [];
+    let queryEmbedding: Float32Array | null = null;
+    try {
+      const embeddings = await Promise.all(queries.map(q => embed(q)));
+      queryEmbedding = embeddings[0];
+      vectorLists = await Promise.all(
+        embeddings.map(emb => engine.searchVector(emb, searchOpts)),
+      );
+    } catch {
+      // Embedding failure is non-fatal, fall back to keyword-only
+    }
+    return { vectorLists, queryEmbedding };
+  })();
+
+  const [keywordResults, { vectorLists, queryEmbedding }] = await Promise.all([
+    keywordPromise,
+    vectorPromise,
+  ]);
 
   if (vectorLists.length === 0) {
     // Embed/vector failed silently; record that vector did not run.
